@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  导出日志的分享路径。
+
+  日志导出到 cacheDir/exports/，因为这个目录不需要任何存储权限、随时可写，系统也会在
+  空间紧张时自己清理。FileProvider 只放行下面列出的这些子目录：Android/data 与
+  Download/hackios 也一并列出，用户选择「保存到 Download」后可以直接从文件管理器分享。
+-->
+<paths>
+    <cache-path name="exports" path="exports/" />
+    <files-path name="run" path="run/" />
+    <external-files-path name="hackios" path="hackios/" />
+    <external-path name="download" path="Download/hackios/" />
+</paths>

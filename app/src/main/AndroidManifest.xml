@@ -1,0 +1,69 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+    <!-- Needed to fetch the IPSW from Apple's CDN and to talk to the local QEMU QMP/monitor. -->
+    <uses-permission android:name="android.permission.INTERNET" />
+
+    <!-- The guest's DNS is served by QEMU's slirp, which normally reads /etc/resolv.conf to learn
+         which server to forward to. Android has no such file, so the app reads the live DNS
+         servers from ConnectivityManager and passes them as `-netdev user,...,dns=`. Only the
+         network state (not the traffic) is inspected. -->
+    <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
+
+    <!-- The firmware is kept permanently in the public Downloads directory
+         (Download/hackios/ipsw) and the built images are published to Download/hackios/images,
+         so both survive app data clears and stay visible to a file manager. Android 11+ needs
+         "all files access" for that; without it the app falls back to its own external
+         directory. The legacy permissions cover Android 13 devices that still honour the
+         requestLegacyExternalStorage path. -->
+    <uses-permission android:name="android.permission.MANAGE_EXTERNAL_STORAGE" />
+    <uses-permission android:name="android.permission.WRITE_EXTERNAL_STORAGE" />
+    <uses-permission android:name="android.permission.READ_EXTERNAL_STORAGE" />
+
+    <!-- A 6.1 GB download must survive the screen turning off. Without these two normal-level
+         permissions Doze parks the CPU and the Wi-Fi driver drops to power-save, which is exactly
+         the "network is fine but the speed collapsed to a few KB/s" symptom. -->
+    <uses-permission android:name="android.permission.WAKE_LOCK" />
+    <uses-permission android:name="android.permission.CHANGE_WIFI_STATE" />
+
+    <!-- MCP 端口是本机 / 局域网的 HTTP 服务（http://127.0.0.1:8765/mcp）。
+         targetSdk 28 起明文默认被禁止，这里显式放开：adb forward 与局域网直连都走 http。
+         端口默认只监听 127.0.0.1；绑定 0.0.0.0 的局域网模式强制校验 Bearer token。 -->
+    <application
+        android:allowBackup="true"
+        android:usesCleartextTraffic="true"
+        android:icon="@mipmap/ic_launcher"
+        android:roundIcon="@mipmap/ic_launcher"
+        android:label="@string/app_name"
+        android:largeHeap="true"
+        android:requestLegacyExternalStorage="true"
+        android:supportsRtl="true"
+        android:theme="@style/Theme.HackiOS">
+
+        <activity
+            android:name=".MainActivity"
+            android:configChanges="orientation|screenSize|screenLayout|keyboardHidden|uiMode"
+            android:exported="true"
+            android:screenOrientation="portrait"
+            android:windowSoftInputMode="adjustResize">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
+
+        <!-- 导出完整日志后分享出去。日志有几十万行，粘进聊天框是不可能的；分享的是文件本身，
+             对方拿到的是完整、可搜索的文本。authorities 用 applicationId 拼，避免与别的
+             应用（或 debug/release 变体）撞车。 -->
+        <provider
+            android:name="androidx.core.content.FileProvider"
+            android:authorities="${applicationId}.fileprovider"
+            android:exported="false"
+            android:grantUriPermissions="true">
+            <meta-data
+                android:name="android.support.FILE_PROVIDER_PATHS"
+                android:resource="@xml/file_paths" />
+        </provider>
+    </application>
+
+</manifest>

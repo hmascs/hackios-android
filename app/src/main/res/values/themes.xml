@@ -1,0 +1,16 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- Everything visible is drawn by Compose; the platform theme only has to stay out of the
+         way: no action bar, no title, edge-to-edge.
+         The window background matches the light wallpaper base (#F3F5FB) so a cold start shows the
+         same colour as the first composed frame instead of flashing black. values-night overrides
+         it with the dark base. -->
+    <style name="Theme.HackiOS" parent="@android:style/Theme.Material.Light.NoActionBar">
+        <item name="android:windowBackground">#F3F5FB</item>
+        <item name="android:statusBarColor">@android:color/transparent</item>
+        <item name="android:navigationBarColor">@android:color/transparent</item>
+        <item name="android:windowLayoutInDisplayCutoutMode">shortEdges</item>
+        <item name="android:windowLightStatusBar">true</item>
+        <item name="android:windowLightNavigationBar">true</item>
+    </style>
+</resources>

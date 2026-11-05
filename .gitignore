@@ -1,0 +1,29 @@
+# Gradle / Android
+.gradle/
+build/
+local.properties
+captures/
+.externalNativeBuild/
+.cxx/
+
+# IDE
+.idea/
+*.iml
+.kotlin/
+
+# 测试产物
+artifacts/
+app/build/
+app/release/
+*.hprof
+
+# 系统
+.DS_Store
+Thumbs.db
+
+# 体积大 / 涉及第三方版权的二进制资源：不入库，构建前自行准备（见 README「资源」一节）
+app/src/main/assets/QEMU_EFI.fd
+app/src/main/assets/QEMU_VARS.fd
+app/src/main/assets/qemu-android-bundle.zip
+app/src/main/assets/hackios-toolchain.zip
+app/src/main/assets/mach.development.bcm2837

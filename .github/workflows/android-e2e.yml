@@ -1,0 +1,143 @@
+name: HackiOS iOS 27 重构 · 云端 E2E
+# 说明：本仓库未内置任何密钥。CI 中用仓库 Secrets 注入：
+#   MAESTRO_API_KEY       Maestro Cloud 的 API key
+#   GOOGLE_APPLICATION_CREDENTIALS / GCP_SA_KEY  Firebase Test Lab 的服务账号
+# 没有密钥时，workflow 只跑「构建 + 单元测试」，不会伪造通过结果。
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  # GitHub Actions 不允许在 job 级 if 里读 secrets（secrets 上下文在 job 级不可用），
+  # 所以先用一个 step 把「有没有密钥」写进 job outputs，后续 job 用 needs.*.outputs 判断。
+  preflight:
+    runs-on: ubuntu-latest
+    outputs:
+      maestro: ${{ steps.check.outputs.maestro }}
+      gcp: ${{ steps.check.outputs.gcp }}
+    steps:
+      - id: check
+        env:
+          MAESTRO_API_KEY: ${{ secrets.MAESTRO_API_KEY }}
+          GCP_SA_KEY: ${{ secrets.GCP_SA_KEY }}
+        run: |
+          echo "maestro=$([ -n "$MAESTRO_API_KEY" ] && echo true || echo false)" >> "$GITHUB_OUTPUT"
+          echo "gcp=$([ -n "$GCP_SA_KEY" ] && echo true || echo false)" >> "$GITHUB_OUTPUT"
+
+  build-and-unit-test:
+    needs: preflight
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+
+      - uses: android-actions/setup-android@v3
+        with:
+          packages: 'platform-tools'
+
+      - name: Install SDK platform 37 + build-tools 37
+        run: |
+          yes | sdkmanager --licenses > /dev/null || true
+          sdkmanager --install "platforms;android-37.2" "build-tools;37.0.0" \
+            || sdkmanager --install "platforms;android-37" "build-tools;36.0.0"
+
+      - name: Unit tests
+        run: ./gradlew :app:testDebugUnitTest --stacktrace
+
+      - name: Assemble debug APK
+        run: ./gradlew :app:assembleDebug
+
+      - name: Assemble release APK (R8)
+        run: ./gradlew :app:assembleRelease
+
+      - name: Assemble androidTest APK
+        run: ./gradlew :app:assembleDebugAndroidTest
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: apks
+          path: |
+            app/build/outputs/apk/debug/*.apk
+            app/build/outputs/apk/androidTest/debug/*.apk
+          retention-days: 14
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: unit-test-report
+          path: app/build/reports/tests/testDebugUnitTest
+
+  maestro-cloud:
+    needs: [ preflight, build-and-unit-test ]
+    if: needs.preflight.outputs.maestro == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: apks
+          path: artifacts
+      - name: Install Maestro
+        run: curl -Ls "https://get.maestro.mobile.dev" | bash
+      - name: Upload app to Maestro Cloud and run flows
+        env:
+          MAESTRO_API_KEY: ${{ secrets.MAESTRO_API_KEY }}
+        run: |
+          ~/.maestro/bin/maestro cloud \
+            --api-key "$MAESTRO_API_KEY" \
+            --app-file artifacts/app-debug.apk \
+            --device-model "Pixel 7" \
+            --android-api-level 34 \
+            --output artifacts/maestro-report \
+            .maestro
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: maestro-report
+          path: artifacts/maestro-report
+
+  firebase-test-lab:
+    needs: [ preflight, build-and-unit-test ]
+    if: needs.preflight.outputs.gcp == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: apks
+          path: artifacts
+      - uses: google-github-actions/auth@v2
+        with:
+          credentials_json: ${{ secrets.GCP_SA_KEY }}
+      - uses: google-github-actions/setup-gcloud@v2
+      - name: Run instrumentation on API 33 / 34 / 35
+        run: |
+          gcloud firebase test android run \
+            --type instrumentation \
+            --app artifacts/app-debug.apk \
+            --test artifacts/app-debug-androidTest.apk \
+            --device model=oriole,version=33,locale=zh_CN \
+            --device model=oriole,version=34,locale=zh_CN \
+            --device model=shiba,version=35,locale=zh_CN \
+            --use-orchestrator \
+            --timeout 30m \
+            --results-bucket "gs://${{ secrets.GCP_RESULTS_BUCKET }}" \
+            --results-dir "hackios-${{ github.run_id }}"
+      - name: Fetch artifacts (screenshots, logcat, semantics)
+        if: always()
+        run: |
+          mkdir -p artifacts/ftl
+          gsutil -m cp -r "gs://${{ secrets.GCP_RESULTS_BUCKET }}/hackios-${{ github.run_id }}/*" artifacts/ftl/ || true
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: ftl-results
+          path: artifacts/ftl

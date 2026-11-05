@@ -1,0 +1,18 @@
+appId: com.android.gudao.iphoneos
+name: 04 · 启动失败也有明确反馈（无镜像时）
+tags:
+  - error-path
+---
+# 冷启动、没有任何镜像时点「启动 iOS」：必须给出「还没有可启动的镜像」+ 下一步，
+# 而不是静默失败或闪退。这一条直接保护 B1（启动前不准备 payload）与 B7（失败无反馈）。
+- launchApp
+- extendedWaitUntil:
+    visible: "启动 iOS"
+    timeout: 180000
+- tapOn: "启动 iOS"
+- extendedWaitUntil:
+    visible: "还没有可启动的镜像"
+    timeout: 120000
+- assertVisible: "编译镜像"
+- takeScreenshot: shots/06_start_without_images
+

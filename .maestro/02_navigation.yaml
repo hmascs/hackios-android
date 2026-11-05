@@ -1,0 +1,37 @@
+appId: com.android.gudao.iphoneos
+name: 02 · 标签栏与页面转场
+tags:
+  - smoke
+---
+- launchApp
+- extendedWaitUntil:
+    visible: "设备"
+    timeout: 180000
+- tapOn: "资源"
+- extendedWaitUntil:
+    visible: "iOS 16.5 固件"
+    timeout: 120000
+- assertVisible: "系统镜像"
+- assertVisible: "编译镜像"
+- takeScreenshot: shots/02_library
+
+- tapOn: "设置"
+- extendedWaitUntil:
+    visible: "外观"
+    timeout: 120000
+- assertVisible: "处理器核心"
+- assertVisible: "虚拟网络"
+- assertVisible: "外观"
+- takeScreenshot: shots/03_settings
+
+- tapOn: "屏幕"
+- extendedWaitUntil:
+    visible: "QEMU 没有运行"
+    timeout: 120000
+- assertVisible: "启动 iOS"
+- takeScreenshot: shots/04_display_empty
+
+- tapOn: "设备"
+- extendedWaitUntil:
+    visible: "启动 iOS"
+    timeout: 120000

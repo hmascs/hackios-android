@@ -1,0 +1,17 @@
+appId: com.android.gudao.iphoneos
+name: 01 · 启动与首页渲染
+tags:
+  - smoke
+---
+# 首页 = iOS 27 分组列表 + 液态玻璃大标题 + 底部标签栏。
+# TCG 软件模拟下首帧可能要 30–90 s，所以第一条断言用 extendedWaitUntil（默认断言只等几秒）。
+- launchApp:
+    clearState: false
+- extendedWaitUntil:
+    visible: "设备"
+    timeout: 180000
+- assertVisible: "启动 iOS"
+- assertVisible: "实时画面"
+- assertVisible: "环境"
+- assertVisible: "处理器核心"
+- takeScreenshot: shots/01_device_light_or_dark

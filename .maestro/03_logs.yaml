@@ -1,0 +1,30 @@
+appId: com.android.gudao.iphoneos
+name: 03 · 日志页与自动跟随
+tags:
+  - logs
+---
+- launchApp
+- extendedWaitUntil:
+    visible: "设备"
+    timeout: 180000
+- tapOn:
+    text: "日志"
+    index: 0
+- extendedWaitUntil:
+    visible: "串口"
+    timeout: 120000
+- assertVisible: "日志"
+- tapOn: "QEMU"
+- extendedWaitUntil:
+    visible: "还没有QEMU日志"
+    timeout: 60000
+- tapOn: "串口"
+- tapOn: "跟随中"
+- assertVisible: "已暂停"
+- takeScreenshot: shots/05_logs
+- tapOn: "跟随中"
+- assertVisible: "跟随中"
+- back
+- extendedWaitUntil:
+    visible: "启动 iOS"
+    timeout: 120000

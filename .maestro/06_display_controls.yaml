@@ -1,0 +1,38 @@
+appId: com.android.gudao.iphoneos
+name: 06 · 触控面板（需要已编译镜像）
+tags:
+  - long
+---
+# 覆盖 B5/B6：拖动不再退化成连点，取帧失败有重试。
+# 前置条件：设备上已有 system.apfs / root.apfs（由 05 或真机预置）。
+# 没有镜像时本 flow 会停在「还没有可启动的镜像」，这是预期的——它需要真镜像才能继续。
+- launchApp
+- extendedWaitUntil:
+    visible: "设备"
+    timeout: 180000
+- tapOn: "屏幕"
+- extendedWaitUntil:
+    visible: "QEMU 没有运行"
+    timeout: 120000
+- runFlow:
+    when:
+      visible: "QEMU 没有运行"
+    commands:
+      - tapOn: "启动 iOS"
+      - extendedWaitUntil:
+          visible: "主屏"
+          timeout: 300000
+- assertVisible: "主屏"
+- assertVisible: "锁屏"
+- assertVisible: "音量+"
+- assertVisible: "上滑"
+- takeScreenshot: shots/09_display_running
+
+# 主屏键应产生一次点击（而不是长按或拖动）
+- tapOn: "主屏"
+- tapOn: "上滑"
+- assertVisible: "实时"
+- tapOn: "更多"
+- assertVisible: "重新取帧"
+- tapOn: "重新取帧"
+- takeScreenshot: shots/10_display_sheet

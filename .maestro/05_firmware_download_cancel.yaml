@@ -1,0 +1,38 @@
+appId: com.android.gudao.iphoneos
+name: 05 · 下载进度 / 暂停 / 续传入口
+tags:
+  - network
+---
+# 覆盖 B2：下载必须可暂停、可续传，而不是只能等到 6.2 GB 全部结束。
+- launchApp
+- extendedWaitUntil:
+    visible: "设备"
+    timeout: 180000
+- tapOn: "资源"
+- extendedWaitUntil:
+    visible: "iOS 16.5 固件"
+    timeout: 120000
+- runFlow:
+    when:
+      visible: "下载固件"
+    commands:
+      - tapOn: "下载固件"
+      - tapOn:
+          text: "允许"
+          optional: true
+      - extendedWaitUntil:
+          visible: "暂停"
+          timeout: 120000
+      - takeScreenshot: shots/07_download_running
+      - tapOn: "暂停"
+      - assertVisible: "继续下载"
+      - assertVisible: "已暂停"
+      - takeScreenshot: shots/08_download_paused
+- runFlow:
+    when:
+      visible: "继续下载"
+    commands:
+      - tapOn: "继续下载"
+      - extendedWaitUntil:
+          visible: "暂停"
+          timeout: 120000
