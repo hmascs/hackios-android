@@ -6,6 +6,7 @@ plugins {
 android {
     namespace = "com.android.gudao.iphoneos"
     compileSdk = 37
+    buildToolsVersion = "37.0.0"
 
     defaultConfig {
         applicationId = "com.android.gudao.iphoneos"
@@ -46,8 +47,8 @@ android {
         // 掩码（`taskset c0`），不认 util-linux 的 `-c 6-7`；旧探测只按 util-linux 试，于是在
         // 绝大多数手机上首轮就失败、整体降级。现在两种语法都试，并用子进程打印的
         // Cpus_allowed_list 验证「真的钉住了」而不是只看退出码。
-        versionCode = 49
-        versionName = "0.29.9"
+        versionCode = 51
+        versionName = "0.30"
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
     }
 

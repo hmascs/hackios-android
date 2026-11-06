@@ -4,7 +4,7 @@
 App 本身是一个用 **Jetpack Compose + Glasmio（iOS 27 液态玻璃设计语言）** 重写的四标签原生界面，
 负责下载/校验固件、拼装启动镜像、拉起 QEMU、把帧缓冲画到 SurfaceView、再把触屏和按键变成 QMP 输入事件。
 
-> 包名 `com.android.gudao.iphoneos` · 版本 `0.29.9 (49)` · `minSdk 33` / `targetSdk 28` / `compileSdk 37`
+> 包名 `com.android.gudao.iphoneos` · 版本 `0.30 (51)` · `minSdk 33` / `targetSdk 28` / `compileSdk 37`
 
 ---
 
@@ -119,7 +119,7 @@ Issues 或 GitHub 的资料页联系作者；作者会在核实后 **24 小时�
 
 | 问题 | 状态 |
 |---|---|
-| 客户机触摸事件在部分镜像上无界面反应 | **未解决**。已定位到「虚拟 HID 服务已注册并收到事件、但系统未响应该事件」这一段，详见 `docs/engineering-notes.md` |
+| 触摸在部分构建上无反应 | **0.30 已修复根因**：开机脚本 `userland/rc.jobs` 里并发的多个程序会抢在 内核 virtio 输入驱动初始化之前打开 `/dev/hakios-touch`，导致驱动整个不初始化（控制台里看不到 `virtio-input: device in slot N`），主机通过 QMP 送进去的输入因此永远到不了客户机。0.30 把该脚本减到只剩一行上滑手势，主机输入恢复。 |
 | 首次启动耗时长 | 软件模拟固有代价；已做启动脚本精简与后台竞争去除 |
 | 部分服务缺位导致日志刷屏 | 精简镜像未包含激活链等守护进程，属已知噪音 |
 
@@ -141,7 +141,7 @@ tools/                  辅助脚本
 
 ## 8. 版本
 
-当前 `0.29.9 (49)`。逐版本变更见 [`docs/README-legacy.md`](docs/README-legacy.md) 与
+当前 `0.30 (51)`。逐版本变更见 [`docs/README-legacy.md`](docs/README-legacy.md) 与
 [`docs/engineering-notes.md`](docs/engineering-notes.md)。
 
 ## 9. 许可证
