@@ -1,152 +1,104 @@
 # HackiOS for Android
 
-在 Android 手机上，通过 QEMU（TCG 纯软件模拟）跑起一套 iOS 风格的桌面环境。
-App 本身是一个用 **Jetpack Compose + Glasmio（iOS 27 液态玻璃设计语言）** 重写的四标签原生界面，
-负责下载/校验固件、拼装启动镜像、拉起 QEMU、把帧缓冲画到 SurfaceView、再把触屏和按键变成 QMP 输入事件。
+**在 Android 手机上探索 XNU 与 iOS 用户空间的运行。**
 
-> 包名 `com.android.gudao.iphoneos` · 版本 `0.30 (51)` · `minSdk 33` / `targetSdk 28` / `compileSdk 37`
+HackiOS 将 QEMU、自编 XNU 内核和 Android 原生前端整合在一起，提供固件准备、镜像构建、系统启动、画面显示与触摸控制。界面采用 Jetpack Compose 与 Glasmio，支持深浅色主题。
 
----
+[下载 0.4](https://github.com/hmascs/hackios-android/releases/tag/v0.4) · [App 源码](https://github.com/hmascs/hackios-android/tree/v0.4) · [XNU 内核源码](https://github.com/hmascs/hackios-android/releases/download/v0.4/HackiOS-XNU-0.4-source.tar.gz) · [反馈问题](https://github.com/hmascs/hackios-android/issues)
 
-## ⚠️ 免责声明（请务必先读）
+> **0.4 · Android 13+ · ARM64**
+>
+> 包名：`com.android.gudao.iphoneos` · versionCode：`68`
 
-**本项目是一个独立的、非营利的个人技术研究与学习项目。它不属于 Apple Inc.，也没有得到 Apple Inc. 的任何授权、认可或赞助。**
+## 主要功能
 
-1. **不提供、不分发任何 Apple 软件。** 本仓库的源码与发布产物中**不包含** iOS / iPadOS / macOS 的系统镜像、
-   XNU 内核、dyld 共享缓存、应用程序、图标或任何其他 Apple 拥有版权的二进制文件。运行时所需的一切 Apple
-   软件材料，均由使用者自行从其合法拥有的设备或渠道取得，本项目只提供「装载」与「显示」的技术手段。
-2. **不与 Apple 的现有产品或服务竞争**，不提供任何绕过激活、绕过授权、破解 DRM 或规避正版购买的功能。
-   本项目**不是**越狱工具，**不能**用于激活任何设备，**不能**用于安装未经授权的 App。
-3. **仅供个人学习、研究、教学与界面设计参考。** 严禁用于任何商业用途、二次销售、预装在待售设备中，
-   或用于任何违反当地法律法规的用途。
-4. **"iOS"、"iPhone"、"Apple" 等名称与商标归 Apple Inc. 所有。** 本项目中出现的相关名称仅用于
-   客观描述被模拟的软件环境（合理使用 / 指明性使用），不表示任何关联或背书。
-5. **风险自负。** 本项目按 GPLv2「按原样」提供，不附带任何明示或暗示的担保。使用本项目所导致的一切
-   后果（包括但不限于数据丢失、设备损坏、账号封禁、法律责任、以及因使用非官方软件而违反
-   Apple 软件许可协议的风险）由使用者自行承担。
-6. **请优先在你自己合法拥有的硬件上做界面设计验证。** 如果你只是想学习 iOS 风格的 UI 实现，
-   Apple 官方的 Human Interface Guidelines 与 Xcode 模拟器是更合适的途径。
+- **手机端镜像准备**：固件下载支持续传与校验；镜像构建带阶段记录，便于中断后继续。
+- **两种图形后端**：OSMesa 软件渲染，以及实验性的 Adreno GPU 渲染。在首页选择后端、查看设备与运行资源状态。
+- **原生分辨率显示**：保持 **1125 × 2436**，从最终帧缓冲获取画面。
+- **触摸与控制**：通过 QMP 和 virtio 输入设备传递点击、滑动及按键事件，并保留串口日志供排查。
+- **独立数据盘**：OSMesa 与 Adreno 均可选择数据盘模式、容量和是否接入；不同容量使用独立文件。
+- **开放源码**：App、GPU 桥接实现及自编 XNU 内核源码分别提供，并附构建说明、来源与校验值。
 
-**权利人下架请求**：如果你是有权主体，认为本仓库的任何内容侵犯了你的权利，请通过本仓库的
-Issues 或 GitHub 的资料页联系作者；作者会在核实后 **24 小时内移除相关内容**，无需先行发起 DMCA 流程。
+## 开始使用
 
----
+1. 从 [0.4 Release](https://github.com/hmascs/hackios-android/releases/tag/v0.4) 下载并安装 `HackiOS-0.4.apk`。
+2. 首次打开时授予所需存储权限，按 App 引导准备固件与系统镜像。专有系统材料需由使用者自行合法取得。
+3. 在首页选择图形后端。如需连接数据盘，在“存储”中选择模式与容量。
+4. 构建完成后启动系统。首次构建和 TCG 启动可能需要较长时间，可在日志页查看实际进度。
 
-## 1. 这个项目能做什么
+**升级说明**：0.4 恢复原包名，并沿用原版签名。原包名的旧版可覆盖安装；临时使用其他包名的版本有独立的 Android 私有目录，跨包名安装不会自动迁移其中的数据。不要为升级而删除原有磁盘或镜像。
 
-| 能力 | 说明 |
-|---|---|
-| 固件下载 | 内置可续传 / 可取消 / 可校验的分块下载器，带失败分类（网络、磁盘、校验、服务端） |
-| 镜像构建 | 在手机本机上解包固件并重组成启动镜像（APFS 打包 + 载荷拼接），带阶段检查点，中断后可续 |
-| 启动模拟 | 拉起 QEMU（`-M virt` + TCG 多线程），加载引导器与内核，等待桌面出现 |
-| 画面显示 | 通过 HMP `screendump` 取帧 + 软件解码上屏，自动裁剪、等比、无黑边 |
-| 输入注入 | 触摸 / 滑动 / 长按 / Home / 锁屏 / 音量，全部经 QMP `input-send-event` 送到虚机 |
-| 画质与性能 | 多档性能预设、分辨率与缩放控制、帧率与耗时统计、CPU 亲和性绑定 |
-| 日志系统 | 串口日志实时汇聚、分级、可暂停、可清除、可导出 |
-| 界面 | iOS 27 液态玻璃风格的 Compose 界面：启动、控制、日志、设置四个标签 |
+### 运行要求
 
-## 2. 界面与设计
+| 项目 | 要求与当前范围 |
+| --- | --- |
+| Android | Android 13 及以上 |
+| 处理器 | ARM64；客户机 CPU 通过 QEMU TCG 模拟，不要求 Root 或 KVM |
+| 内存 | 当前客户机配置使用 7 GiB；宿主还需为 Android、App 与翻译缓存保留余量 |
+| 存储 | 预留固件、解包镜像、构建产物与运行内存文件所需空间 |
+| 软件渲染 | OSMesa 路径可用，速度取决于 CPU 与负载 |
+| GPU 渲染 | 当前限定 Adreno 8xx；**已实测 Adreno 830**，其他 8xx 型号未完成验收 |
 
-- 设计语言：**Glasmio** —— 液态玻璃材质、动态模糊、半透明层叠、SF 风格的圆角与字重。
-- 四标签：**启动 / 控制 / 日志 / 设置**，状态栏、底部 Home 指示条均按 iOS 的视觉规范实现。
-- 完整的深浅色适配与 16 套强调色。
-- 设计规范与组件清单见 [`docs/design-system.md`](docs/design-system.md)。
+## 0.4 更新
 
-## 3. 技术架构
+- 恢复 `com.android.gudao.iphoneos` 包名，版本号更新为 **0.4**。
+- 为 Adreno 后端接入数据盘，磁盘参数由 App 按实际选择生成，避免旧启动参数与界面设置冲突。
+- 引入有界的 GPU 命令批处理，减少小命令逐条等待回复；遇到旧 worker 时保留串行回退。
+- 修复 IOSurface 差分基线、尾字节指纹、顶点索引及纹理通道映射问题，保留完整有效像素回写。
+- 使用最终 RAMFB 画面作为显示来源；离屏 GL 回读环保留诊断用途。
+- 改善触摸释放、启动状态提示、资源操作互斥与有效 NVRAM 的保护。
 
-```
-┌─────────────────────────── Android App (Kotlin) ───────────────────────────┐
-│  ui/         Compose + Glasmio 界面                                         │
-│  engine/     ChunkPlan · BuildCheckpoint · QemuPreflight · TouchMapper      │
-│              QemuFailure（失败分类）· CapturePipeline（取帧与退避）          │
-│  QemuRunner  载荷构建 + QEMU 进程生命周期 + 参数下发                          │
-│  ImageBuilder 设备端解包 + APFS 打包（阶段检查点）                            │
-│  FramebufferView  SurfaceView 绘制 + 触摸事件采集                            │
-└───────────────┬──────────────────────────────────┬─────────────────────────┘
-                │ QMP  (控制 / 输入)                │ HMP (screendump 取帧)
-        ┌───────▼──────────────────────────────────▼───────┐
-        │            QEMU（aarch64, TCG multi-thread）      │
-        │   virt + GICv3 + cortex-a76 + virtio-input        │
-        │   virtio-tablet / virtio-keyboard / ramfb         │
-        └───────────────────────┬──────────────────────────┘
-                                │ 客户机
-                    iOS 风格桌面环境（用户自行提供）
+完整变化与附件校验值见 [发布说明](https://github.com/hmascs/hackios-android/releases/tag/v0.4)。
+
+## GPU 与数据盘的当前状态
+
+**GPU 加速的是图形命令，客户机 CPU 仍使用 TCG。** 当前图形链路为：
+
+```text
+客户机 GLES → remoteGL → Zink → Vulkan → Turnip → Adreno GPU
 ```
 
-关键实现取舍（都写在 `docs/engineering-notes.md` 里，含被推翻的结论）：
+Adreno 默认启用命令批处理。如需对照，可在“设置 → 内核启动参数”填入 `glbatch=0`，于下次启动关闭。
 
-- **不靠 GPU、不靠 KVM**：TCG 纯软件模拟 + ramfb 软件渲染，因此在没有 KVM 的普通手机上也能跑。
-- **取帧走 `screendump` 而不是共享内存**：客户机显示没有 EGL 表面，帧缓冲是 QEMU 侧的 ramfb，
-  `screendump` 是唯一稳定可得的像素来源；配合退避与健康状态避免把 CPU 打满。
-- **输入走 `input-send-event`**：复用 QEMU 自带的 virtio 输入设备，不修改 QEMU。
+**数据盘接入与 iOS 用户数据持久化是两个阶段。** 0.4 已允许 GPU 后端连接所选块设备；独立临时盘已通过 HFS+ 写入、同步、卸载重挂和第二次启动读回。当前常规系统的 `/private/var` 仍在 RAM 中，App 不会自动格式化现有盘或将该目录迁移到磁盘，因此不能据此保证整个 iOS 状态跨重启保留。
 
-## 4. 构建
+## 已验证与已知限制
 
-需要 JDK 17 与 Android SDK（`compileSdk 37`）。
+| 验证项 | 0.4 结果 |
+| --- | --- |
+| Android 单元测试 | 45 个测试套件、376 项通过，0 失败/错误 |
+| 安装包身份 | 原包名、版本、签名证书与包内组件哈希已核验 |
+| GPU 原生对照 | 9 组 shader 场景开关批处理后像素与 GL 错误一致；请求数由 201 降至 153 |
+| 数据盘短验收 | 相同发行内核下，新建 128 MiB HFS+ 盘完成两次启动读回，网络和输入设备正常识别，QCOW2 检查通过 |
 
-```bash
-# 调试包（体积大、可调试）
-./gradlew :app:assembleDebug
+GPU 请求数变化描述的是原生测试负载，**不等于整机帧率提升**。原分辨率下实际可见内容 **10 FPS 仍是优化目标，尚未通过验收**。部分图形场景、完整系统中的 GPU 与存储组合、其他设备兼容性及连续动画仍需进一步测试。
 
-# 发布包（R8 压缩）
-./gradlew :app:assembleRelease
+数据盘测试使用专用最小来宾，未运行 SpringBoard 或 GPU 绘制，也未访问、格式化或覆盖用户已有磁盘。完整测试范围见 Release 中的 `HackiOS-0.4-storage-test.json`。
+
+## 源码与构建
+
+0.4 Release 提供以下材料：
+
+| 文件 | 内容 |
+| --- | --- |
+| `HackiOS-0.4.apk` | 可安装的 0.4 版本 |
+| `HackiOS-0.4-source.tar.gz` | 对应的 App、GPU 桥接源码与精确 GPU assets |
+| `HackiOS-XNU-0.4-source.tar.gz` | 自编 XNU 与 HFS 源码、配置、构建脚本、来源及许可证 |
+| `HackiOS-0.4-resource-manifest.json` | 较大启动资源的完整哈希与恢复位置 |
+| `SHA256SUMS-0.4.txt` | 发布附件的 SHA-256 校验清单 |
+
+App 构建需要 **JDK 21** 和 **Android SDK 37**。先按 [0.4 构建说明](https://github.com/hmascs/hackios-android/blob/v0.4/BUILD_0.4.md) 恢复源码树未包含的运行资源，再执行：
+
+```sh
+./gradlew :app:testDebugUnitTest :app:assembleDebug -PgpuTest=true
 ```
 
-产物在 `app/build/outputs/apk/`。已构建好的调试包见本仓库的 **Releases**。
+`-PgpuTest=true` 会将本版 GPU assets 纳入安装包。签名私钥、Apple SDK 与专有系统镜像不包含在源码中。
 
-### 资源（需要自行准备，未入库）
+内核归档中的源码关联到已与 APK 核对一致的本地构建产物，并保留来源和排除项清单；**本次尚未完成干净环境逐字节重建验收**。构建所需的外部工具链与 SDK，以及被排除的可选硬件固件，均须按归档说明另行准备。
 
-以下二进制体积大且涉及第三方版权，**不放在仓库里**，构建前请自行放入 `app/src/main/assets/`：
+## 许可与项目说明
 
-| 文件 | 说明 |
-|---|---|
-| `QEMU_EFI.fd` / `QEMU_VARS.fd` | UEFI 固件（EDK2，开源，可自行编译或由 App 内置流程生成） |
-| `qemu-android-bundle.zip` | Android 平台用的 QEMU 可执行文件打包（QEMU 为 GPLv2，可自行编译） |
-| `hackios-toolchain.zip` | 客户机侧辅助工具链 |
-| `mach.development.bcm2837` | 客户机内核。**属于第三方版权材料，本仓库不提供、不分发**，请自行准备 |
+Android App 源码采用 [GPL v2](LICENSE)。XNU 及其修改保留 **APSL 2.0** 和各文件原有声明，其他依赖遵循各自许可证；详见 [第三方组件说明](https://github.com/hmascs/hackios-android/blob/v0.4/THIRD_PARTY_NOTICES.md)。
 
-缺少这些资源时，Gradle 仍可编译通过，但 App 无法完成启动流程。
-
-## 5. 运行
-
-1. 安装 APK（Android 13 及以上）。
-2. 首次启动按提示授予存储权限与（如需要）通知权限。
-3. 在「启动」页让 App 完成固件准备与镜像构建（首次较慢，支持中断续做）。
-4. 构建完成后点击启动，等待桌面出现（软件模拟下通常需要数分钟，取决于手机性能）。
-5. 在「控制」页或直接点画面进行触摸操作；「日志」页可查看串口输出。
-
-## 6. 已知问题
-
-| 问题 | 状态 |
-|---|---|
-| 触摸在部分构建上无反应 | **0.30 已修复根因**：开机脚本 `userland/rc.jobs` 里并发的多个程序会抢在 内核 virtio 输入驱动初始化之前打开 `/dev/hakios-touch`，导致驱动整个不初始化（控制台里看不到 `virtio-input: device in slot N`），主机通过 QMP 送进去的输入因此永远到不了客户机。0.30 把该脚本减到只剩一行上滑手势，主机输入恢复。 |
-| 首次启动耗时长 | 软件模拟固有代价；已做启动脚本精简与后台竞争去除 |
-| 部分服务缺位导致日志刷屏 | 精简镜像未包含激活链等守护进程，属已知噪音 |
-
-项目**不虚构任何测试结论**：没有在真机上验证过的功能，文档里一律标注为「未验证」。
-
-## 7. 目录结构
-
-```
-app/                    Android 应用
-  src/main/java/...      Kotlin 源码（ui / engine / 服务）
-  src/main/res/         资源与图标
-  src/test/             单元测试
-docs/                   设计文档、工程笔记、排障记录
-screenshots/            界面截图
-tools/                  辅助脚本
-.maestro/               端到端测试编排
-.github/workflows/      CI 配置
-```
-
-## 8. 版本
-
-当前 `0.30 (51)`。逐版本变更见 [`docs/README-legacy.md`](docs/README-legacy.md) 与
-[`docs/engineering-notes.md`](docs/engineering-notes.md)。
-
-## 9. 许可证
-
-源码以 **GNU General Public License v2.0** 发布，全文见 [`LICENSE`](LICENSE)。
-第三方组件（QEMU、EDK2、Glasmio 等）遵循其各自许可证。
-
-再次提醒：**本项目不分发任何 Apple 软件，也不提供任何绕过授权的能力。**
+HackiOS 是独立的研究项目，与 Apple Inc. 无关联，未获其授权或认可。项目不提供专有系统镜像或绕过授权的能力。Apple、iOS、iPhone 等商标归各自权利人所有。使用与再分发请遵循相应组件和系统材料的许可，实验前备份重要数据。
