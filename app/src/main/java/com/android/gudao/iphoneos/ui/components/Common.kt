@@ -26,6 +26,7 @@ import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.offset
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
@@ -40,6 +41,7 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.Shape
 import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.hapticfeedback.HapticFeedbackType
 import androidx.compose.ui.platform.LocalHapticFeedback
@@ -52,10 +54,10 @@ import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.fillMaxSize
-import androidx.compose.foundation.shape.RoundedCornerShape
 import com.android.gudao.iphoneos.state.ToastMessage
 import com.android.gudao.iphoneos.ui.theme.LocalIosAccents
 import io.github.neoruaa.glasmio.core.IosTypography
+import io.github.neoruaa.glasmio.core.LocalGlasmioShapes
 import io.github.neoruaa.glasmio.ui.GlasmioCard
 import io.github.neoruaa.glasmio.ui.glasmioGroupedListBackground
 
@@ -70,14 +72,14 @@ import io.github.neoruaa.glasmio.ui.glasmioGroupedListBackground
 @Composable
 fun GlassPanel(
     modifier: Modifier = Modifier,
-    corner: Dp = 26.dp,
+    shape: Shape = LocalGlasmioShapes.current.medium,
     onClick: (() -> Unit)? = null,
     content: @Composable ColumnScope.() -> Unit,
 ) {
     Column(
         modifier
             .fillMaxWidth()
-            .clip(RoundedCornerShape(corner))
+            .clip(shape)
             .then(
                 if (onClick != null) {
                     Modifier.clickable(
@@ -89,7 +91,7 @@ fun GlassPanel(
                     Modifier
                 },
             )
-            .glasmioGroupedListBackground(RoundedCornerShape(corner))
+            .glasmioGroupedListBackground(shape)
             .padding(horizontal = 16.dp, vertical = 14.dp),
         content = content,
     )
@@ -302,6 +304,9 @@ fun GlassActionButton(
     Box(
         modifier
             .graphicsLayer { scaleX = scale; scaleY = scale }
+            // Keep the visual capsule exactly as before while guaranteeing the 44dp touch target
+            // that the rest of the app's controls (GlasmioButton) already have.
+            .heightIn(min = 44.dp)
             .clip(CircleShape)
             .background(tint.copy(alpha = if (enabled) 0.16f else 0.08f))
             .clickable(
@@ -346,7 +351,7 @@ fun GlassKey(
     Column(
         modifier
             .graphicsLayer { scaleX = scale; scaleY = scale }
-            .clip(RoundedCornerShape(18.dp))
+            .clip(LocalGlasmioShapes.current.small)
             .background(tint.copy(alpha = if (enabled) 0.10f else 0.04f))
             .clickable(interactionSource = interaction, indication = null, enabled = enabled) {
                 haptics.performHapticFeedback(HapticFeedbackType.LongPress)
@@ -417,7 +422,7 @@ fun ToastHost(messages: List<ToastMessage>, onDismiss: (Long) -> Unit) {
                         IosGlyph(
                             when (m.kind) {
                                 ToastMessage.Kind.Success -> Glyph.Check
-                                ToastMessage.Kind.Error -> Glyph.Lock
+                                ToastMessage.Kind.Error -> Glyph.Alert
                                 else -> Glyph.Circle
                             },
                             size = 16.dp,

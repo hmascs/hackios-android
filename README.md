@@ -4,7 +4,7 @@
 App 本身是一个用 **Jetpack Compose + Glasmio（iOS 27 液态玻璃设计语言）** 重写的四标签原生界面，
 负责下载/校验固件、拼装启动镜像、拉起 QEMU、把帧缓冲画到 SurfaceView、再把触屏和按键变成 QMP 输入事件。
 
-> 包名 `com.android.gudao.iphoneos` · 版本 `0.30 (51)` · `minSdk 33` / `targetSdk 28` / `compileSdk 37`
+> 包名 `com.android.gudao.iphoneos` · 版本 `0.4 (68)` · `minSdk 33` / `targetSdk 28` / `compileSdk 37`
 
 ---
 
@@ -12,9 +12,9 @@ App 本身是一个用 **Jetpack Compose + Glasmio（iOS 27 液态玻璃设计�
 
 **本项目是一个独立的、非营利的个人技术研究与学习项目。它不属于 Apple Inc.，也没有得到 Apple Inc. 的任何授权、认可或赞助。**
 
-1. **不提供、不分发任何 Apple 软件。** 本仓库的源码与发布产物中**不包含** iOS / iPadOS / macOS 的系统镜像、
-   XNU 内核、dyld 共享缓存、应用程序、图标或任何其他 Apple 拥有版权的二进制文件。运行时所需的一切 Apple
-   软件材料，均由使用者自行从其合法拥有的设备或渠道取得，本项目只提供「装载」与「显示」的技术手段。
+1. **不提供 iOS / iPadOS / macOS 系统镜像、dyld 共享缓存或系统应用。** 运行所需的专有系统材料由使用者自行取得。
+   XNU 是单独的开源组件：0.4 的配套发布材料将自编内核对应源码、补丁、构建来源及哈希与 App 源码区分列出；
+   XNU 及其修改保留 APSL 2.0 和文件原有许可，不因与 App 一同发布而改为 GPLv2。详见 [第三方说明](THIRD_PARTY_NOTICES.md)。
 2. **不与 Apple 的现有产品或服务竞争**，不提供任何绕过激活、绕过授权、破解 DRM 或规避正版购买的功能。
    本项目**不是**越狱工具，**不能**用于激活任何设备，**不能**用于安装未经授权的 App。
 3. **仅供个人学习、研究、教学与界面设计参考。** 严禁用于任何商业用途、二次销售、预装在待售设备中，
@@ -75,10 +75,14 @@ Issues 或 GitHub 的资料页联系作者；作者会在核实后 **24 小时�
 
 关键实现取舍（都写在 `docs/engineering-notes.md` 里，含被推翻的结论）：
 
-- **不靠 GPU、不靠 KVM**：TCG 纯软件模拟 + ramfb 软件渲染，因此在没有 KVM 的普通手机上也能跑。
+- **CPU 走 TCG，不要求 KVM**：OSMesa 提供软件渲染路径；实验性 Adreno 后端把支持的 GLES 命令交给宿主 Zink → Vulkan → Turnip。后者不改变客户机 CPU 仍由 TCG 模拟的事实。
 - **取帧走 `screendump` 而不是共享内存**：客户机显示没有 EGL 表面，帧缓冲是 QEMU 侧的 ramfb，
   `screendump` 是唯一稳定可得的像素来源；配合退避与健康状态避免把 CPU 打满。
-- **输入走 `input-send-event`**：复用 QEMU 自带的 virtio 输入设备，不修改 QEMU。
+- **输入走 `input-send-event`**：复用 QEMU 自带的 virtio 输入设备。
+- **GPU 后端（OpenGL ES / Vulkan）**：见 [GPU 后端与设备验收](docs/gpu-backends.md)，含真实 iOS 的 Adreno 830 像素回环。
+- **GPU 后端数据盘（实验）**：可单独连接公共目录的 QCOW2 数据盘，与启动镜像和 RAM 分离；App 管理 `virtio_blk` 开关。块设备可连接/可写不等于 `/private/var` 已迁到磁盘，写入、同步和重新启动后的持久性须另验。见 [数据盘与验收边界](docs/ios-data-disk.md)。
+- **命令批处理**：HTB1 的实际 C client → Adreno worker 九组 shader 对照中，串行请求从 201 降到 153，像素哈希与 GL 错误保持一致；这是该测试负载的请求数变化，**不是整机 FPS**。完整系统启动、交互与内容帧率分别验收。
+- **虚拟设备模块与性能基线**：见 [QEMU 显示性能与虚拟设备接口](docs/qemu-performance-drivers.md)，含真机测量、内置驱动注册 API 和 QEMU PPM 批量写入补丁。
 
 ## 4. 构建
 
@@ -103,7 +107,7 @@ Issues 或 GitHub 的资料页联系作者；作者会在核实后 **24 小时�
 | `QEMU_EFI.fd` / `QEMU_VARS.fd` | UEFI 固件（EDK2，开源，可自行编译或由 App 内置流程生成） |
 | `qemu-android-bundle.zip` | Android 平台用的 QEMU 可执行文件打包（QEMU 为 GPLv2，可自行编译） |
 | `hackios-toolchain.zip` | 客户机侧辅助工具链 |
-| `mach.development.bcm2837` | 客户机内核。**属于第三方版权材料，本仓库不提供、不分发**，请自行准备 |
+| `mach.development.bcm2837` | 客户机内核；使用与发布清单匹配的自编产物，配套 XNU 源码、补丁、构建来源与许可单独提供 |
 
 缺少这些资源时，Gradle 仍可编译通过，但 App 无法完成启动流程。
 
@@ -141,12 +145,11 @@ tools/                  辅助脚本
 
 ## 8. 版本
 
-当前 `0.30 (51)`。逐版本变更见 [`docs/README-legacy.md`](docs/README-legacy.md) 与
-[`docs/engineering-notes.md`](docs/engineering-notes.md)。
+当前 `0.4 (68)`，包名恢复为 `com.android.gudao.iphoneos`。发布 APK、对应 App 源码包、XNU 源码包及各自 SHA-256 以该版本发布清单为准；不能用旧 main 分支或历史 GPU asset 代替实际二进制来源。历史变更见 [`docs/README-legacy.md`](docs/README-legacy.md) 与 [`docs/engineering-notes.md`](docs/engineering-notes.md)。
 
 ## 9. 许可证
 
 源码以 **GNU General Public License v2.0** 发布，全文见 [`LICENSE`](LICENSE)。
-第三方组件（QEMU、EDK2、Glasmio 等）遵循其各自许可证。
+第三方组件（XNU、QEMU、Mesa/Turnip、EDK2、Glasmio 等）遵循各自许可证；XNU 内核源码与修改单独保留 APSL 2.0。组件来源及源码包范围见 [`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md)。
 
-再次提醒：**本项目不分发任何 Apple 软件，也不提供任何绕过授权的能力。**
+本项目不提供专有系统镜像，也不提供任何绕过授权的能力。

@@ -31,6 +31,7 @@ import com.android.gudao.iphoneos.Constants
 import com.android.gudao.iphoneos.state.AppUiState
 import com.android.gudao.iphoneos.state.BuildUi
 import com.android.gudao.iphoneos.state.DownloadUi
+import com.android.gudao.iphoneos.state.QemuUi
 import com.android.gudao.iphoneos.ui.Fmt
 import com.android.gudao.iphoneos.ui.components.GlassActionButton
 import com.android.gudao.iphoneos.ui.components.GlassBanner
@@ -47,7 +48,6 @@ import io.github.neoruaa.glasmio.core.IosTypography
 import io.github.neoruaa.glasmio.scaffold.GlasmioPinnedListPage
 import io.github.neoruaa.glasmio.ui.GlasmioGroupedList
 import io.github.neoruaa.glasmio.ui.GlasmioListRow
-import io.github.neoruaa.glasmio.ui.GlasmioSectionTitle
 
 data class LibraryActions(
     val download: () -> Unit,
@@ -55,6 +55,8 @@ data class LibraryActions(
     val verify: () -> Unit,
     val compile: () -> Unit,
     val cancelCompile: () -> Unit,
+    /** 编译完成后的「下一步」：直接启动，不用先回设备页。 */
+    val start: () -> Unit,
     val openDiagnostics: () -> Unit,
     val openLogs: () -> Unit,
     /** 无「所有文件访问」权限时，下载按钮变为「授予储存权限」，点它拉起系统授权页。 */
@@ -71,6 +73,8 @@ fun LibraryScreen(
     val d = state.download
     val b = state.build
     val art = state.artifacts
+    val resourceBusy = state.qemu is QemuUi.Running || state.qemu is QemuUi.Starting ||
+        state.build is BuildUi.Running || state.diagnostics.running
 
     GlasmioPinnedListPage(
         title = "资源",
@@ -104,6 +108,10 @@ fun LibraryScreen(
                             is DownloadUi.Ready -> accents.green
                             is DownloadUi.Failed -> accents.red
                             is DownloadUi.Paused -> accents.orange
+                            DownloadUi.Idle ->
+                                // 未下载不是「进行中」，用中性色；蓝色留给正在做的事。
+                                if (art.firmwarePresent) accents.blue
+                                else LocalContentColor.current.copy(alpha = 0.55f)
                             else -> accents.blue
                         },
                     )
@@ -224,14 +232,17 @@ fun LibraryScreen(
 
                         is DownloadUi.Ready -> {
                             GlassActionButton("重新校验", actions.verify, LocalContentColor.current.copy(alpha = 0.6f), Modifier.weight(1f))
-                            GlassActionButton("下一步：编译", actions.compile, accents.blue, Modifier.weight(1f))
+                            GlassActionButton(
+                                "下一步：编译", actions.compile, accents.blue, Modifier.weight(1f),
+                                enabled = !resourceBusy,
+                            )
                         }
 
                         else -> {
                             // 没有「所有文件访问」权限时写不进 Download/hackios，先要权限而不是
                             // 让用户点了下载才发现什么都没发生。storageIsPublic 为真才显示下载。
                             if (!art.storageIsPublic && !art.firmwarePresent) {
-                                GlassActionButton("授予储存权限", actions.requestStorage, accents.orange, Modifier.weight(1f))
+                                GlassActionButton("授予存储权限", actions.requestStorage, accents.orange, Modifier.weight(1f))
                             } else {
                                 GlassActionButton(
                                     if (art.firmwarePresent) "校验" else "下载固件",
@@ -249,21 +260,34 @@ fun LibraryScreen(
             }
         }
 
-        item { GlasmioSectionTitle("系统镜像") }
+        item { SectionLabel("系统镜像") }
         item {
             GlasmioGroupedList {
                 GlasmioListRow(
                     title = "system.apfs",
                     subtitle = "Apple 只读根文件系统",
                     detail = if (art.systemImagePresent) Fmt.bytes(art.systemBytes) else "缺失",
-                    leading = { IosGlyph(Glyph.Doc, size = 20.dp, tint = accents.green) },
+                    // Icon colour follows presence: a green doc next to 缺失 read as "OK".
+                    leading = {
+                        IosGlyph(
+                            Glyph.Doc,
+                            size = 20.dp,
+                            tint = if (art.systemImagePresent) accents.green else accents.orange,
+                        )
+                    },
                     showTopSeparator = false,
                 )
                 GlasmioListRow(
                     title = "root.apfs",
                     subtitle = "redwood 用户态与启动任务",
                     detail = if (art.rootImagePresent) Fmt.bytes(art.rootBytes) else "缺失",
-                    leading = { IosGlyph(Glyph.Doc, size = 20.dp, tint = accents.green) },
+                    leading = {
+                        IosGlyph(
+                            Glyph.Doc,
+                            size = 20.dp,
+                            tint = if (art.rootImagePresent) accents.green else accents.orange,
+                        )
+                    },
                 )
                 GlasmioListRow(
                     title = "镜像版本",
@@ -274,7 +298,7 @@ fun LibraryScreen(
             }
         }
 
-        item { GlasmioSectionTitle("在设备上编译") }
+        item { SectionLabel("在设备上编译") }
         item {
             GlassPanel(Modifier.testTag("build_card")) {
                 when (b) {
@@ -327,9 +351,23 @@ fun LibraryScreen(
                             color = LocalContentColor.current.copy(alpha = 0.6f),
                         )
                         Spacer(Modifier.height(12.dp))
+                        // 主流程的下一步是启动，不是再看一次日志：把它做成主按钮，避免用户
+                        // 编译完还要自己想起来回设备页。QEMU 已在跑时禁用，免得「点了没反应」。
+                        val qemuBusy = state.qemu is QemuUi.Running || state.qemu is QemuUi.Starting
+                        GlassActionButton(
+                            if (qemuBusy) "QEMU 运行中" else "启动 iOS",
+                            actions.start,
+                            accents.blue,
+                            Modifier.fillMaxWidth(),
+                            enabled = !qemuBusy,
+                        )
+                        Spacer(Modifier.height(8.dp))
                         Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
-                            GlassActionButton("重新编译", actions.compile, LocalContentColor.current.copy(alpha = 0.6f), Modifier.weight(1f))
-                            GlassActionButton("查看日志", actions.openLogs, accents.blue, Modifier.weight(1f))
+                            GlassActionButton(
+                                "重新编译", actions.compile, LocalContentColor.current.copy(alpha = 0.6f), Modifier.weight(1f),
+                                enabled = !resourceBusy,
+                            )
+                            GlassActionButton("查看日志", actions.openLogs, LocalContentColor.current.copy(alpha = 0.6f), Modifier.weight(1f))
                         }
                     }
 
@@ -342,27 +380,32 @@ fun LibraryScreen(
                             modifier = Modifier.padding(top = 6.dp),
                         )
                         Spacer(Modifier.height(12.dp))
-                        GlassActionButton("继续编译", actions.compile, accents.blue, Modifier.fillMaxWidth())
+                        GlassActionButton("继续编译", actions.compile, accents.blue, Modifier.fillMaxWidth(), enabled = !resourceBusy)
                     }
 
                     is BuildUi.Failed -> {
                         Text(b.message, style = IosTypography.headline, color = accents.red)
-                        b.detail?.let {
-                            // A failure carries up to forty lines of a step's output, and the
-                            // reason is in the LAST of them. Printed as one paragraph it pushed
-                            // the buttons off the screen and grew the card by a screenful, so
-                            // the one line worth reading sat below the fold. Bounded height,
-                            // scrolled from the bottom: the traceback is what you see first.
+                        b.detail?.let { detail ->
+                            val failureScroll = rememberScrollState()
+                            // The reason is in the LAST lines of the output. The old card only
+                            // applied verticalScroll() and stayed at the top, so the one line
+                            // worth reading really did sit below the fold. Two frames let the
+                            // list measure before scrolling to the end.
+                            LaunchedEffect(detail) {
+                                androidx.compose.runtime.withFrameNanos { }
+                                androidx.compose.runtime.withFrameNanos { }
+                                failureScroll.scrollTo(failureScroll.maxValue)
+                            }
                             Spacer(Modifier.height(8.dp))
                             Box(
                                 Modifier
                                     .fillMaxWidth()
                                     .heightIn(max = 220.dp)
-                                    .verticalScroll(rememberScrollState())
+                                    .verticalScroll(failureScroll)
                                     .testTag("build_failure_detail"),
                             ) {
                                 Text(
-                                    it,
+                                    detail,
                                     style = IosTypography.caption2,
                                     fontFamily = FontFamily.Monospace,
                                     color = LocalContentColor.current.copy(alpha = 0.62f),
@@ -371,8 +414,16 @@ fun LibraryScreen(
                         }
                         Spacer(Modifier.height(12.dp))
                         Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
-                            GlassActionButton("重试", actions.compile, accents.blue, Modifier.weight(1f))
-                            GlassActionButton("日志", actions.openLogs, LocalContentColor.current.copy(alpha = 0.6f), Modifier.weight(1f))
+                            // "还没有固件" is a Failed state too; retrying the build just fails
+                            // again. Send that case to the download action instead.
+                            GlassActionButton(
+                                if (art.firmwarePresent) "重试" else "下载固件",
+                                if (art.firmwarePresent) actions.compile else actions.download,
+                                accents.blue,
+                                Modifier.weight(1f),
+                                enabled = !resourceBusy,
+                            )
+                            GlassActionButton("查看日志", actions.openLogs, LocalContentColor.current.copy(alpha = 0.6f), Modifier.weight(1f))
                         }
                     }
 
@@ -380,19 +431,27 @@ fun LibraryScreen(
                         Text("生成 system.apfs 与 root.apfs", style = IosTypography.headline)
                         Text(
                             "使用 APK 内置的脚本与 Termux 工具链，在手机上解包固件并打包 APFS 镜像。" +
-                                "首次要解包 7.4 GB、打包 2.5 GB，手机上通常 1–3 小时（列表与打包阶段没有百分比，属正常）。" +
+                                "首次要解包 7.4 GB、打包 2.5 GB：通常 20–40 分钟，处理器较弱时可能 1–3 小时" +
+                                "（列表与打包阶段没有百分比，属正常）。" +
                                 "已完成的阶段会记住，取消后不会重做。",
                             style = IosTypography.caption1,
                             color = LocalContentColor.current.copy(alpha = 0.6f),
                             modifier = Modifier.padding(top = 6.dp),
                         )
                         Spacer(Modifier.height(12.dp))
-                        GlassActionButton(
-                            if (art.imagesReady) "重新编译镜像" else "编译镜像",
-                            actions.compile,
-                            accents.blue,
-                            Modifier.fillMaxWidth(),
-                        )
+                        // compileImages() needs the IPSW. Without it the button used to fail into
+                        // a "还没有固件" card whose only action was another failing compile.
+                        if (!art.firmwarePresent) {
+                            GlassActionButton("先下载固件", actions.download, accents.blue, Modifier.fillMaxWidth())
+                        } else {
+                            GlassActionButton(
+                                if (art.imagesReady) "重新编译镜像" else "编译镜像",
+                                actions.compile,
+                                accents.blue,
+                                Modifier.fillMaxWidth(),
+                                enabled = !resourceBusy,
+                            )
+                        }
                     }
                 }
             }

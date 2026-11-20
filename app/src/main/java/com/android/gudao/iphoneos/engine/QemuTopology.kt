@@ -34,6 +34,14 @@ object QemuTopology {
      * [HOST_CORES_DEFAULT] 独立提供，不靠堆 vCPU。
      */
     const val GUEST_VCPU_DEFAULT = 2
+    const val ADRENO_GUEST_CORES = 2
+
+    /** Effective launch/display values; switching back restores the saved OSMesa profile. */
+    data class BackendCpu(val guestCores: Int, val mttcg: Boolean, val guestSettingsEditable: Boolean)
+
+    fun backendCpu(adreno: Boolean, savedCores: Int, savedMttcg: Boolean): BackendCpu =
+        if (adreno) BackendCpu(ADRENO_GUEST_CORES, mttcg = true, guestSettingsEditable = false)
+        else BackendCpu(normalize(savedCores), mttcg = savedMttcg, guestSettingsEditable = true)
 
     /** 0.24.0 云端验证过的六核并行档；保留为推荐上限与自动降核的参考，不再是默认值。 */
     const val STABLE_CORES = 6

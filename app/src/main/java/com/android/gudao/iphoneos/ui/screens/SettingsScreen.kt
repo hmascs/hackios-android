@@ -1,7 +1,6 @@
 package com.android.gudao.iphoneos.ui.screens
 
 import com.android.gudao.iphoneos.engine.BootTimeline
-import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -11,8 +10,6 @@ import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.width
-import androidx.compose.foundation.shape.RoundedCornerShape
-import androidx.compose.foundation.text.BasicTextField
 import androidx.compose.material3.LocalContentColor
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
@@ -22,20 +19,21 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
-import androidx.compose.ui.graphics.SolidColor
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.text.font.FontWeight
-import androidx.compose.ui.text.input.PasswordVisualTransformation
-import androidx.compose.ui.text.input.VisualTransformation
 import androidx.compose.ui.unit.dp
 import com.android.gudao.iphoneos.mcp.McpConfig
 import com.android.gudao.iphoneos.state.AppUiState
+import com.android.gudao.iphoneos.state.BuildUi
+import com.android.gudao.iphoneos.state.DownloadUi
 import com.android.gudao.iphoneos.state.GlassStrength
+import com.android.gudao.iphoneos.engine.QemuTopology
 import com.android.gudao.iphoneos.state.QemuUi
 import com.android.gudao.iphoneos.state.ThemeMode
+import com.android.gudao.iphoneos.ui.components.Editor
+import com.android.gudao.iphoneos.ui.components.EditorSheet
 import com.android.gudao.iphoneos.ui.components.GlassPanel
 import com.android.gudao.iphoneos.ui.components.Glyph
 import com.android.gudao.iphoneos.ui.components.IosGlyph
@@ -48,7 +46,6 @@ import io.github.neoruaa.glasmio.ui.GlasmioActionSheetContent
 import io.github.neoruaa.glasmio.ui.GlasmioAlertButtonRole
 import io.github.neoruaa.glasmio.ui.GlasmioAlertButtonSpec
 import io.github.neoruaa.glasmio.ui.GlasmioAlertDialog
-import io.github.neoruaa.glasmio.ui.GlasmioBottomSheet
 import io.github.neoruaa.glasmio.ui.GlasmioGroupedList
 import io.github.neoruaa.glasmio.ui.GlasmioListRow
 import io.github.neoruaa.glasmio.ui.GlasmioSegmentedControl
@@ -62,11 +59,9 @@ data class SettingsActions(
     val setHostCores: (Int) -> Unit,
     val setMttcg: (Boolean) -> Unit,
     val setAutoFallback: (Boolean) -> Unit,
-    val setNet: (Boolean) -> Unit,
     val setFollow: (Boolean) -> Unit,
     val forceCleanup: () -> Unit,
     val openDiagnostics: () -> Unit,
-    val copyPath: () -> Unit,
     /** 复制一段文本到剪贴板，第二个参数是提示里显示的标签。 */
     val copyText: (String, String) -> Unit,
     val setMcpEnabled: (Boolean) -> Unit,
@@ -81,16 +76,6 @@ data class SettingsActions(
     val applyBootArgs: (String) -> Boolean,
 )
 
-/** 正在编辑的文本项。放在一个 data class 里，避免为每个字段各写一个 bool。 */
-private data class Editor(
-    val title: String,
-    val hint: String,
-    val initial: String,
-    val secret: Boolean,
-    val placeholder: String,
-    val onConfirm: (String) -> Boolean,
-)
-
 @Composable
 fun SettingsScreen(
     state: AppUiState,
@@ -101,6 +86,11 @@ fun SettingsScreen(
     val context = LocalContext.current
     val version = rememberVersion(context)
     val running = state.qemu is QemuUi.Running
+    val hardwareLocked = running || state.qemu is QemuUi.Starting
+    val diagnosticsBusy = state.diagnostics.running
+    val resourceBusy = hardwareLocked || state.build is BuildUi.Running || diagnosticsBusy
+    val cpu = QemuTopology.backendCpu(state.settings.experimentalGpu, state.settings.smp, state.settings.mttcg)
+    val guestCpuEditable = !hardwareLocked && cpu.guestSettingsEditable
     val mcp = state.settings.mcp
     val mcpState = state.mcp
 
@@ -108,11 +98,13 @@ fun SettingsScreen(
     var confirmWrite by remember { mutableStateOf(false) }
     var confirmFull by remember { mutableStateOf(false) }
     var confirmToken by remember { mutableStateOf(false) }
+    var confirmCleanup by remember { mutableStateOf(false) }
 
     GlasmioPinnedListPage(
         title = "设置",
         bottomPadding = 144.dp,
-        subtitle = "性能、外观与存储",
+        // 存储已经在 0.31.0 挪到首页，副标题还留着「存储」会把人送去错误的地方。
+        subtitle = "性能、MCP 与外观",
         modifier = modifier.testTag("screen_settings"),
     ) {
         item { SectionLabel("性能 · Guest 与宿主解耦") }
@@ -124,14 +116,17 @@ fun SettingsScreen(
                     Column(Modifier.weight(1f)) {
                         Text("Guest vCPU（SMP 拓扑）", style = IosTypography.subheadline, fontWeight = FontWeight.Medium)
                         Text(
-                            if (running) "运行中不可修改"
-                            else "XNU 看到的处理器数，决定 SMP bringup 稳定性。默认 2 核最稳；调高会加重 IPI / 锁竞争",
+                            when {
+                                !cpu.guestSettingsEditable -> "Adreno 固定双核。切回 OSMesa 后恢复之前的设置。"
+                                hardwareLocked -> "启动或运行中不可修改"
+                                else -> "XNU 看到的 vCPU 数。默认 2 核；增加 vCPU 不一定加快启动。"
+                            },
                             style = IosTypography.caption2,
                             color = LocalContentColor.current.copy(alpha = 0.5f),
                         )
                     }
                     Text(
-                        "${state.settings.smp} vCPU",
+                        "${cpu.guestCores} vCPU",
                         style = IosTypography.subheadline,
                         color = accents.blue,
                         fontWeight = FontWeight.SemiBold,
@@ -139,24 +134,26 @@ fun SettingsScreen(
                 }
                 Spacer(Modifier.height(4.dp))
                 GlasmioSlider(
-                    value = state.settings.smp.toFloat(),
-                    onValueChange = { actions.setSmp(it.toInt().coerceIn(1, 8)) },
+                    value = cpu.guestCores.toFloat(),
+                    onValueChange = { if (guestCpuEditable) actions.setSmp(QemuTopology.normalize(it.toInt())) },
                     modifier = Modifier.fillMaxWidth().testTag("slider_smp"),
-                    valueRange = 1f..8f,
-                    enabled = !running,
+                    valueRange = QemuTopology.MIN_CORES.toFloat()..QemuTopology.MAX_CORES.toFloat(),
+                    enabled = guestCpuEditable,
                 )
             }
         }
         item {
             GlassPanel {
                 Row(verticalAlignment = Alignment.CenterVertically) {
-                    IosGlyph(Glyph.Cpu, size = 20.dp, tint = accents.green)
+                    // 绿色在本 App 里表示「成功 / 已开启」，宿主算力池只是另一组可调参数，
+                    // 用蓝色主操作色，避免看起来像一个成功状态。
+                    IosGlyph(Glyph.Cpu, size = 20.dp, tint = accents.blue)
                     Spacer(Modifier.width(10.dp))
                     Column(Modifier.weight(1f)) {
                         Text("宿主算力池（Host compute pool）", style = IosTypography.subheadline, fontWeight = FontWeight.Medium)
                         Text(
-                            if (running) "运行中不可修改"
-                            else "允许 QEMU 进程族调度到的物理核数 + TCG 翻译缓存预算。默认 8 核；不增加 vCPU，也不重建镜像",
+                            if (hardwareLocked) "启动或运行中不可修改"
+                            else "宿主调度与翻译缓存预算，不改变来宾 vCPU，也不重建镜像。",
                             style = IosTypography.caption2,
                             color = LocalContentColor.current.copy(alpha = 0.5f),
                         )
@@ -164,23 +161,21 @@ fun SettingsScreen(
                     Text(
                         "${state.settings.hostCores} 核",
                         style = IosTypography.subheadline,
-                        color = accents.green,
+                        color = accents.blue,
                         fontWeight = FontWeight.SemiBold,
                     )
                 }
                 Spacer(Modifier.height(4.dp))
                 GlasmioSlider(
                     value = state.settings.hostCores.toFloat(),
-                    onValueChange = { actions.setHostCores(it.toInt().coerceIn(2, 8)) },
+                    onValueChange = { if (!hardwareLocked) actions.setHostCores(QemuTopology.normalizeHostCores(it.toInt())) },
                     modifier = Modifier.fillMaxWidth().testTag("slider_host_cores"),
-                    valueRange = 2f..8f,
-                    enabled = !running,
+                    valueRange = QemuTopology.HOST_CORES_MIN.toFloat()..QemuTopology.HOST_CORES_MAX.toFloat(),
+                    enabled = !hardwareLocked,
                 )
+                val tbMiB = if (cpu.mttcg) QemuTopology.tbSize(state.settings.hostCores) else QemuTopology.TB_SIZE_BASE
                 Text(
-                    "当前档：TB 缓存按 ${state.settings.hostCores} 核规格分配。" +
-                        "启动时先读系统放行的核（Cpus_allowed_list）并优先选大核钉核，例如 4-7，" +
-                        "而不再是写死的 0-${state.settings.hostCores - 1}——小核编号通常在前，钉错会比不钉更慢。" +
-                        "系统本就放行全部核、或 setaffinity 被 cpuset 拒绝时不钉核，TB 缓存仍全额生效（详见日志与 perf_stats）。",
+                    "正常启动的 TB 缓存预算：$tbMiB MiB。实际可用宿主核由 Android 限制，见启动日志。",
                     style = IosTypography.caption2,
                     color = LocalContentColor.current.copy(alpha = 0.5f),
                 )
@@ -192,15 +187,16 @@ fun SettingsScreen(
                     Column(Modifier.weight(1f)) {
                         Text("多线程 TCG", style = IosTypography.subheadline, fontWeight = FontWeight.Medium)
                         Text(
-                            "thread=multi：每个 Guest vCPU 一条宿主翻译线程。关闭回到单线程基线排障",
+                            if (!cpu.guestSettingsEditable) "Adreno 固定开启；切回 OSMesa 可用单线程排障。"
+                            else "每个来宾 vCPU 一条宿主执行线程。关闭后使用单线程排障。",
                             style = IosTypography.caption2,
                             color = LocalContentColor.current.copy(alpha = 0.5f),
                         )
                     }
                     GlasmioSwitch(
-                        checked = state.settings.mttcg,
-                        onCheckedChange = { if (!running) actions.setMttcg(it) },
-                        enabled = !running,
+                        checked = cpu.mttcg,
+                        onCheckedChange = { if (guestCpuEditable) actions.setMttcg(it) },
+                        enabled = guestCpuEditable,
                         backdrop = LocalGlassBackdrop.current,
                         onTintColor = accents.blue,
                     )
@@ -213,16 +209,20 @@ fun SettingsScreen(
                     Column(Modifier.weight(1f)) {
                         Text("卡住自动降核", style = IosTypography.subheadline, fontWeight = FontWeight.Medium)
                         Text(
-                            "画面 ${com.android.gudao.iphoneos.Constants.STALL_FALLBACK_MS / 1000} 秒无变化且未进桌面时，" +
-                                "把 Guest vCPU 砍半重启一次（8→4→2 到底即停）。默认 2 核已是下限；" +
-                                "软件渲染下启动可能十几分钟，别把它当卡死",
+                            if (!cpu.guestSettingsEditable) "Adreno 不自动降核或回退。"
+                            else "未进桌面且画面 ${com.android.gudao.iphoneos.Constants.STALL_FALLBACK_MS / 1000} 秒无变化时，" +
+                                "降一档重启，最低 2 核。软件渲染启动可能需要十几分钟。",
                             style = IosTypography.caption2,
                             color = LocalContentColor.current.copy(alpha = 0.5f),
                         )
                     }
                     GlasmioSwitch(
-                        checked = state.settings.autoFallback,
-                        onCheckedChange = { actions.setAutoFallback(it) },
+                        // Was `cpu.guestSettingsEditable && autoFallback`, so a running QEMU showed
+                        // the switch as off even when the setting was on. Show the stored value;
+                        // only Adreno (where fallback is genuinely disabled) forces it off.
+                        checked = if (state.settings.experimentalGpu) false else state.settings.autoFallback,
+                        onCheckedChange = { if (cpu.guestSettingsEditable) actions.setAutoFallback(it) },
+                        enabled = cpu.guestSettingsEditable,
                         backdrop = LocalGlassBackdrop.current,
                         onTintColor = accents.blue,
                     )
@@ -232,7 +232,15 @@ fun SettingsScreen(
 
         // ---- 启动分段计时（0.24.0）----------------------------------------------------------------
         if (state.bootTimeline.active) {
-            item { SectionLabel("启动计时 · 预算 Logo 90s / 桌面 180s") }
+            // 预算只有一处真相：BootTimeline 的两个常量。这里曾经写死过 90s/180s，
+            // 0.29.7 把它们改成 60s/600s 时漏改，于是界面永远显示「✗ 超预算」——
+            // 一次正常但慢的启动被自己的文案判成失败。
+            item {
+                SectionLabel(
+                    "启动计时 · 预算 Logo ${BootTimeline.LOGO_BUDGET_MS / 1000}s / " +
+                        "桌面 ${BootTimeline.DESKTOP_BUDGET_MS / 1000}s"
+                )
+            }
             item {
                 GlassPanel {
                     Column {
@@ -258,7 +266,7 @@ fun SettingsScreen(
                         )
                         Text(
                             "进桌面：" + when (val ms = state.bootTimeline.desktopMs) {
-                                null -> "未到达（预算 180s）"
+                                null -> "未到达（预算 ${BootTimeline.DESKTOP_BUDGET_MS / 1000}s）"
                                 else -> "${ms / 1000}s " +
                                     if (state.bootTimeline.desktopVerdict == true) "✓ 达标" else "✗ 超预算"
                             },
@@ -273,27 +281,6 @@ fun SettingsScreen(
                         )
                     }
                 }
-            }
-        }
-
-        item { SectionLabel("连接") }
-        item {
-            GlasmioGroupedList {
-                GlasmioListRow(
-                    title = "虚拟网络",
-                    subtitle = "slirp NAT，无需 root",
-                    leading = { IosGlyph(Glyph.Network, size = 20.dp, tint = accents.green) },
-                    showTopSeparator = false,
-                    trailing = {
-                        GlasmioSwitch(
-                            checked = state.settings.netEnabled,
-                            onCheckedChange = actions.setNet,
-                            enabled = !running,
-                            backdrop = LocalGlassBackdrop.current,
-                            onTintColor = accents.green,
-                        )
-                    },
-                )
             }
         }
 
@@ -320,9 +307,10 @@ fun SettingsScreen(
                             color = LocalContentColor.current.copy(alpha = 0.5f),
                         )
                     }
+                    // 关闭状态下写「重启」点下去只会得到「MCP 服务已关闭」；改成真正的启动动作。
                     com.android.gudao.iphoneos.ui.components.GlassActionButton(
-                        "重启",
-                        actions.restartMcp,
+                        if (mcp.enabled) "重启" else "启动",
+                        if (mcp.enabled) actions.restartMcp else ({ actions.setMcpEnabled(true) }),
                         accents.blue,
                     )
                 }
@@ -519,7 +507,8 @@ fun SettingsScreen(
                     onClick = {
                         editor = Editor(
                             title = "内核启动参数",
-                            hint = "key=value 形式，例如 debug=0x144 -v。cpus= / rd= / epoch= 由 App 管理。",
+                            hint = "key=value 形式，例如 debug=0x144 -v。cpus= / rd= / epoch= 由 App 管理。" +
+                                "\nAdreno 默认启用命令批处理。填入 glbatch=0 可在下次启动时关闭。",
                             initial = state.settings.bootArgs,
                             secret = false,
                             placeholder = "debug=0x144",
@@ -594,25 +583,6 @@ fun SettingsScreen(
             }
         }
 
-        item { SectionLabel("存储") }
-        item {
-            GlasmioGroupedList {
-                GlasmioListRow(
-                    title = "固件与镜像位置",
-                    subtitle = state.artifacts.storagePath,
-                    leading = { IosGlyph(Glyph.Folder, size = 20.dp, tint = accents.orange) },
-                    showTopSeparator = false,
-                    onClick = actions.copyPath,
-                )
-                GlasmioListRow(
-                    title = "工具链自检",
-                    subtitle = state.diagnostics.summary ?: "检查 bash / python3 / 7zz / unzbm",
-                    leading = { IosGlyph(Glyph.Check, size = 20.dp, tint = accents.blue) },
-                    onClick = actions.openDiagnostics,
-                )
-            }
-        }
-
         item { SectionLabel("维护") }
         item {
             GlassPanel {
@@ -620,15 +590,38 @@ fun SettingsScreen(
                     Column(Modifier.weight(1f)) {
                         Text("清理残留进程", style = IosTypography.subheadline, fontWeight = FontWeight.Medium)
                         Text(
-                            "结束占用 4444/4445 端口的旧 QEMU",
+                            if (running) "会结束当前正在运行的 QEMU（端口 4444/4445）"
+                            else "结束占用 4444/4445 端口的旧 QEMU",
                             style = IosTypography.caption2,
                             color = LocalContentColor.current.copy(alpha = 0.5f),
                         )
                     }
                     com.android.gudao.iphoneos.ui.components.GlassActionButton(
                         "清理",
-                        actions.forceCleanup,
+                        { confirmCleanup = true },
                         accents.orange,
+                    )
+                }
+                Spacer(Modifier.height(12.dp))
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Column(Modifier.weight(1f)) {
+                        Text("工具链自检", style = IosTypography.subheadline, fontWeight = FontWeight.Medium)
+                        Text(
+                            when {
+                                hardwareLocked -> "QEMU 启动或运行中，停止后才能部署或自检"
+                                state.build is BuildUi.Running -> "镜像编译中，完成或取消后才能自检"
+                                diagnosticsBusy -> state.diagnostics.summary ?: "自检进行中"
+                                else -> state.diagnostics.summary ?: "检查 bash / python3 / 7zz / unzbm"
+                            },
+                            style = IosTypography.caption2,
+                            color = LocalContentColor.current.copy(alpha = 0.5f),
+                        )
+                    }
+                    com.android.gudao.iphoneos.ui.components.GlassActionButton(
+                        "自检",
+                        actions.openDiagnostics,
+                        accents.blue,
+                        enabled = !resourceBusy,
                     )
                 }
             }
@@ -657,6 +650,31 @@ fun SettingsScreen(
     // ---- sheets & dialogs ----------------------------------------------------------------------
 
     EditorSheet(editor = editor, onDismiss = { editor = null }, accent = accents.blue)
+
+    if (confirmCleanup) {
+        GlasmioAlertDialog(
+            visible = true,
+            onDismissRequest = { confirmCleanup = false },
+            title = "清理残留进程？",
+            message = if (running) {
+                "QEMU 正在运行，这一步会直接结束当前实例，本次启动进度和未保存的 guest 状态都会丢失。" +
+                    "只是想让界面恢复正常的话，先回设备页点「停止」更稳妥。"
+            } else {
+                "会结束占用 4444/4445 端口的旧 QEMU 进程并释放端口。镜像、固件与数据盘不受影响。"
+            },
+            buttons = listOf(
+                GlasmioAlertButtonSpec("取消", { confirmCleanup = false }, GlasmioAlertButtonRole.Cancel),
+                GlasmioAlertButtonSpec(
+                    "清理",
+                    {
+                        confirmCleanup = false
+                        actions.forceCleanup()
+                    },
+                    GlasmioAlertButtonRole.Destructive,
+                ),
+            ),
+        )
+    }
 
     if (confirmToken) {
         GlasmioAlertDialog(
@@ -727,63 +745,11 @@ fun SettingsScreen(
 }
 
 
-/**
- * 文本编辑用的底部弹层。
- *
- * 用 sheet 而不是 Dialog：Dialog 是独立窗口，拿不到主窗口的 backdrop，玻璃材质在它上面会变成
- * 一块没有采样来源的半透明板；sheet 在同一棵组合树里，glass 正常。
- */
 @Composable
-private fun EditorSheet(editor: Editor?, onDismiss: () -> Unit, accent: Color) {
-    var text by remember(editor) { mutableStateOf(editor?.initial.orEmpty()) }
-
-    GlasmioBottomSheet(visible = editor != null, fitContent = true, onDismissRequest = onDismiss) {
-        val current = editor ?: return@GlasmioBottomSheet
-        GlasmioActionSheetContent(current.title, message = current.hint) {
-            Box(
-                Modifier
-                    .fillMaxWidth()
-                    .padding(horizontal = 16.dp)
-                    .clip(RoundedCornerShape(14.dp))
-                    .background(LocalContentColor.current.copy(alpha = 0.07f))
-                    .padding(horizontal = 14.dp, vertical = 12.dp)
-            ) {
-                if (text.isEmpty()) {
-                    Text(
-                        current.placeholder,
-                        style = IosTypography.subheadline,
-                        color = LocalContentColor.current.copy(alpha = 0.3f),
-                    )
-                }
-                BasicTextField(
-                    value = text,
-                    onValueChange = { text = it },
-                    textStyle = IosTypography.subheadline.copy(color = LocalContentColor.current),
-                    cursorBrush = SolidColor(accent),
-                    singleLine = true,
-                    visualTransformation = if (current.secret) {
-                        PasswordVisualTransformation()
-                    } else {
-                        VisualTransformation.None
-                    },
-                    modifier = Modifier.fillMaxWidth().testTag("field_editor"),
-                )
-            }
-            Spacer(Modifier.height(6.dp))
-            GlasmioListRow(
-                "保存",
-                onClick = {
-                    if (current.onConfirm(text.trim())) onDismiss()
-                },
-            )
-            GlasmioListRow("取消", onClick = onDismiss)
-        }
+private fun rememberVersion(context: android.content.Context): String = remember(context) {
+    try {
+        context.packageManager.getPackageInfo(context.packageName, 0).versionName ?: "—"
+    } catch (t: Throwable) {
+        "—"
     }
-}
-
-@Composable
-private fun rememberVersion(context: android.content.Context): String = try {
-    context.packageManager.getPackageInfo(context.packageName, 0).versionName ?: "—"
-} catch (t: Throwable) {
-    "—"
 }

@@ -243,23 +243,15 @@ object BootErrorCatalog {
         Rule(
             id = "lsd-cpu-monitor-entitlement",
             layer = Layer.DAEMON, severity = Severity.DEGRADED, blocking = false,
-            component = "com.apple.lsd (LaunchServices daemon, pid 见证据)",
-            matchers = listOf("denied attempt to escape CPU monitor", "missing required entitlement"),
-            where = "lsd 注册/枚举服务时的 CPU 资源监控，阶段 6",
-            cause = "这不是「CPU 算错 / CPU 故障」（用户点名批评过的那种含糊结论）：iOS 用 CPU monitor 限制守护进程的 " +
-                "CPU 配额，lsd 在反复查询缺失的 XPC 服务（见 failed-lookup，尤其 com.apple.mobileactivationd）后试图调用 " +
-                "escape CPU monitor 放宽配额继续重试，但本移植镜像未给 lsd 签 com.apple.private 系 entitlement，内核拒绝该请求。" +
-                "本质是「服务缺失 → 重试 → 越权放宽配额被拒」的连锁，属于权限/服务缺失，和 CPU 算力或核数无关。",
-            impact = "lsd 每自旋一轮就吐一行 denied，于是串口里出现几十上百行完全相同的 " +
-                "`process lsd[21] denied attempt to escape CPU monitor`——这是**真实可见的刷屏风暴**，不是无害噪音。 " +
-                "0.26.3 修掉了 RWA_PACKED16 那个把全部按需守护进程 plist 吞掉的 bug，但 mobileactivationd " +
-                "在该精简镜像里**仍未注册**（0.26.3 真机日志里 `failed lookup: name = com.apple.mobileactivationd ... " +
-                "No such process` 仍在），所以 lsd 照样查不到、照样自旋、照样被拒。根子在未提供的激活链守护进程，" +
-                "不在权限本身。SpringBoard 可能已拉起，但激活/安全/persona 链因此不完整。",
-            action = "App 侧：日志视图已对连续重复行做折叠（相同行合并为 `行 (×N)`），消除视觉风暴，" +
-                "但不改磁盘 serial.log（导出/复制仍是完整原始行）。要**根除**这条拒绝，需要 guest 镜像真正提供并拉起 " +
-                "mobileactivationd（把激活链守护进程纳入精简作业集、或补对应 plist/entitlement）——属 guest 侧改动，不在本 App 仓库内。" +
-                "不要为「降刷屏」给 lsd 补 entitlement：那只让它自旋更快，不修复激活链断。",
+            component = "XNU CPU monitor（进程及 PID 见证据，常见为 lsd）",
+            matchers = listOf("denied attempt to escape CPU monitor", "CPU monitor self-denials:"),
+            where = "XNU 的 task_set_cpuusage，来宾进程请求改变 CPU 监控限额",
+            cause = "这不是 CPU 故障。缺少相应 entitlement 时，内核恢复默认值或把限额裁到上限。" +
+                "这是 CPU 监控请求，不是 launchd 的 XPC 服务查找；不能根据这条提示推断服务未安装。",
+            impact = "重复告警可能淹没串口；新内核的累计摘要仍执行相同的权限检查。" +
+                "这组日志本身不证明桌面卡住，也不衡量进程总 CPU 用量。",
+            action = "查看灰底进度区域之外是否真正出现锁屏或桌面。排查时分别核对 CPU 监控告警、CPU 用量和 failed lookup；" +
+                "不要为压低日志量放开 entitlement 或删系统服务。",
         ),
         Rule(
             id = "wifi-assets-missing",
@@ -550,11 +542,11 @@ object BootErrorCatalog {
             component = "QemuControl.screendump / HMP",
             matchers = listOf("取帧耗时", "screendump 第", "无提示符（超时）"),
             where = "Android App 通过 HMP screendump 抓 ramfb 帧",
-            cause = "固定 8 FPS × 每次 8 MB PPM 的取帧会与 QEMU TCG 线程抢宿主 CPU；guest 忙时 HMP 阻塞，" +
+            cause = "每次取帧都是 8 MB PPM 的写入 + 读回解码，会与 QEMU TCG 线程抢宿主 CPU；guest 忙时 HMP 阻塞，" +
                 "真机出现过 76430ms 的单次取帧。不是 guest 卡死，是 App 侧抢核。",
             impact = "画面更新停滞、观感像「卡在界面层」；拖慢整体启动。",
-            action = "0.25.0 的 FramePacer（引导期 2 FPS / 静止 1 FPS / 慢取帧退避）+ PPM/Bitmap 缓冲复用 + " +
-                "0.26.0 解耦算力池已把争抢降到最低；perf-stats.json 可核对实际档位。",
+            action = "0.32.0 的 FramePacer（60 FPS 目标 + 慢取帧退避）+ PPM/Bitmap 缓冲复用 + " +
+                "0.26.0 解耦算力池已把争抢降到最低；perf-stats.json 可核对实测 fps 与单帧耗时，目标值不等于实测值。",
             paramExtractors = mapOf("captureMs" to Regex("""取帧耗时\s*(\d+)ms""")),
         ),
 

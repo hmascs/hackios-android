@@ -42,6 +42,9 @@ class SettingsRepository(context: Context) {
         mttcg = prefs.getBoolean(KEY_MTTCG, Constants.MTTCG_DEFAULT),
         autoFallback = prefs.getBoolean(KEY_AUTO_FALLBACK, Constants.AUTO_FALLBACK_DEFAULT),
         perfGateDismissed = prefs.getBoolean(KEY_PERF_GATE, false),
+        dataDiskMode = prefs.getString("data_disk_mode", "DISABLED") ?: "DISABLED",
+        dataDiskGiB = prefs.getInt("data_disk_gib", 8).coerceIn(1, 128),
+        experimentalGpu = prefs.getBoolean("experimental_gpu", false),
     )
 
     /** 第一次启动就生成一个令牌；之后沿用，避免每次重启端口都要重配客户端。 */
@@ -80,6 +83,15 @@ class SettingsRepository(context: Context) {
     /** 0.29.6：性能闸门「不再弹出」。 */
     fun setPerfGateDismissed(value: Boolean) {
         prefs.edit().putBoolean(KEY_PERF_GATE, value).apply()
+    }
+
+
+    fun setExperimentalGpu(value: Boolean) {
+        prefs.edit().putBoolean("experimental_gpu", value).apply()
+    }
+
+    fun setDataDisk(mode: String, gib: Int) {
+        prefs.edit().putString("data_disk_mode", mode).putInt("data_disk_gib", gib).apply()
     }
 
     fun setNet(value: Boolean) {

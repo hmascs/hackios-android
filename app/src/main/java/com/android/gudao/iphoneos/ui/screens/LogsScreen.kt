@@ -11,6 +11,7 @@ import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
@@ -31,6 +32,8 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.platform.testTag
+import androidx.compose.ui.semantics.contentDescription
+import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
@@ -123,14 +126,20 @@ fun LogsScreen(
         modifier = modifier.testTag("screen_logs"),
         actions = {
             // 复制只带走手上这几千行；磁盘上的日志多一个数量级，所以导出是单独的入口。
-            GlasmioIconButton(onClick = { sheet = true }, size = 34.dp) {
+            GlasmioIconButton(
+                onClick = { sheet = true },
+                size = 34.dp,
+                modifier = Modifier.semantics { contentDescription = "导出与分享日志" },
+            ) {
                 IosGlyph(Glyph.Download, size = 17.dp)
             }
         },
     ) { padding ->
         Column(Modifier.fillMaxSize().padding(padding)) {
             Row(
-                Modifier.fillMaxWidth().padding(horizontal = 16.dp).padding(bottom = 8.dp),
+                // GlasmioPinnedPage already applies the 16dp page inset via `padding`; adding
+                // another 16 here made the tabs 32dp from the edge while the log text sat at 30.
+                Modifier.fillMaxWidth().padding(bottom = 8.dp),
                 horizontalArrangement = Arrangement.spacedBy(8.dp),
                 verticalAlignment = Alignment.CenterVertically,
             ) {
@@ -141,6 +150,8 @@ fun LogsScreen(
                     val selected = s == source
                     Box(
                         Modifier
+                            // 26dp 的分段在手机上点不中；44dp 是这一屏其余控件的下限。
+                            .heightIn(min = 44.dp)
                             .clip(CircleShape)
                             .background(
                                 if (selected) accents.blue.copy(alpha = 0.18f)
@@ -148,7 +159,8 @@ fun LogsScreen(
                             )
                             .clickable { source = s }
                             .padding(horizontal = 12.dp, vertical = 6.dp)
-                            .testTag("log_tab_${s.name}")
+                            .testTag("log_tab_${s.name}"),
+                        contentAlignment = Alignment.Center,
                     ) {
                         Text(
                             s.label,
@@ -185,7 +197,13 @@ fun LogsScreen(
                     LazyColumn(
                         state = listState,
                         modifier = Modifier.fillMaxSize().testTag("log_list"),
-                        contentPadding = PaddingValues(horizontal = 14.dp, vertical = 6.dp),
+                        // 底部留出浮动「清除日志 / 跳到最新」的高度，否则最后几行永远被压住。
+                        contentPadding = PaddingValues(
+                            start = 0.dp,
+                            top = 6.dp,
+                            end = 0.dp,
+                            bottom = 76.dp,
+                        ),
                     ) {
                         items(displayLines) { line ->
                             Text(
@@ -205,26 +223,27 @@ fun LogsScreen(
                     }
                 }
 
-                // 0.29.6：清除日志入口挪到右下角。QEMU 运行时置灰不可点——这一轮还在写，
-                // 清了就看不到当次启动过程；停掉以后再点才问「是否删除」。
+                // 0.29.6 把清除日志挪到右下角并「运行中置灰」；但确认弹窗里又专门写了运行中的
+                // 警告，那段文案永远走不到。运行中允许点，交给确认框说明代价；运行中给橙色。
                 val running = state.qemu is QemuUi.Running
                 Box(
                     Modifier
                         .align(Alignment.BottomEnd)
-                        .padding(end = 16.dp, bottom = 16.dp)
+                        // The enclosing Column already carries the 16dp page inset.
+                        .padding(end = 0.dp, bottom = 16.dp)
+                        .heightIn(min = 44.dp)
                         .clip(CircleShape)
-                        .background(
-                            if (running) LocalContentColor.current.copy(alpha = 0.06f)
-                            else accents.red.copy(alpha = 0.16f)
-                        )
-                        .then(if (running) Modifier else Modifier.clickable { confirmClear = true })
+                        .background((if (running) accents.orange else accents.red).copy(alpha = 0.16f))
+                        .clickable { confirmClear = true }
+                        .semantics { contentDescription = "清除日志" }
                         .padding(horizontal = 14.dp, vertical = 8.dp)
-                        .testTag("btn_clear_logs")
+                        .testTag("btn_clear_logs"),
+                    contentAlignment = Alignment.Center,
                 ) {
                     Text(
                         "清除日志",
                         style = IosTypography.caption1,
-                        color = if (running) LocalContentColor.current.copy(alpha = 0.3f) else accents.red,
+                        color = if (running) accents.orange else accents.red,
                         fontWeight = FontWeight.SemiBold,
                     )
                 }
@@ -234,11 +253,13 @@ fun LogsScreen(
                         Modifier
                             .align(Alignment.BottomCenter)
                             .padding(bottom = 20.dp)
+                            .heightIn(min = 44.dp)
                             .clip(CircleShape)
                             .background(accents.blue.copy(alpha = 0.9f))
                             .padding(horizontal = 16.dp, vertical = 8.dp)
                             .testTag("btn_jump_latest")
-                            .clickable { onFollowChange(true) }
+                            .clickable { onFollowChange(true) },
+                        contentAlignment = Alignment.Center,
                     ) {
                         Text(
                             "跳到最新",

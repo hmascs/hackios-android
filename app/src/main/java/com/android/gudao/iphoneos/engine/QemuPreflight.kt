@@ -47,8 +47,12 @@ object QemuPreflight {
      * （wdt=-1 / wdt_test=no_user_checkin / launchd_unsecure_cache=1），旧 payload 须失效以重烘。
      * 0.29.1：+1 到 5。kernel 资产换成上游 prebuilt/hakios-kernel（10-25 构建）；payload
      * stamp 不含 kernel 身份，用 profile 号强制重烘。
+     * 0.30.0：+1 到 6。kernel 资产换成带 bootlog 叠层与 CPU monitor 合并告警的重建内核
+     * （SHA-256 7b1f9083…），cmdline 追加 bootlog=1；旧 payload 必须重烘，否则老用户仍跑旧内核。
+     * 0.31.0：+1 到 7。cmdline 去掉 bootlog=1（不再在 guest 画面上叠日志），旧 payload 里
+     * 仍烘着这条参数，不换号的话已装用户升级后还会看到日志面板。
      */
-    const val CMDLINE_PROFILE = 5
+    const val CMDLINE_PROFILE = 7
 
     /** ram.img 的内容只取决于系统镜像与镜像版本，与核数、启动参数、cmdline 版本无关。 */
     fun ramStampFor(systemApfs: File, rev: Int): String = buildString {
@@ -67,6 +71,7 @@ object QemuPreflight {
     ): String = buildString {
         append("sys=").append(systemApfs.length()).append(':').append(systemApfs.lastModified())
         append(";root=").append(rootApfs.length()).append(':').append(rootApfs.lastModified())
+        if (rootApfs.name.startsWith("root-gpu-")) append(";gpu-root=").append(rootApfs.name)
         append(";smp=").append(smp)
         append(";rev=").append(rev)
         append(";prof=").append(profile)

@@ -147,7 +147,6 @@ fun HackIosApp(
                                 vm = vm,
                                 onOpenLogs = { detail = "logs" },
                                 onOpenDiagnostics = { detail = "diagnostics" },
-                                onOpenMcpSettings = { vm.selectTab(AppTab.Settings) },
                                 onRequestStop = { confirmStop = true },
                             )
                         }
@@ -213,11 +212,18 @@ fun HackIosApp(
                             visible = true,
                             onDismissRequest = { gateAck = true },
                             title = "性能提示",
-                            message = "这台模拟器不依赖 GPU，全靠 CPU 软件渲染，对处理器要求很高。\n\n" +
-                                "高通骁龙 8 Gen 2、天玑 9200、玄戒 O1 及以上的机型，模拟效果更好；" +
-                                "处理器低于这个档位时，开机可能慢到半小时，更严重会触发 LSD 风暴" +
-                                "（launchd 反复重启、系统卡死）。\n\n" +
-                                "已经装了较弱的设备也仍可继续，只是需要多等。",
+                            message = buildString {
+                                append("iOS 客体始终由 QEMU TCG 在 CPU 上模拟。")
+                                append("\n\n图形后端：")
+                                append(
+                                    if (state.settings.experimentalGpu) {
+                                        "Adreno 实验路径（remoteGL → Zink/Turnip → 宿主 GPU；Adreno 830 已实测，其它 8xx 尚未验证）。"
+                                    } else {
+                                        "OSMesa CPU 软件光栅化。"
+                                    }
+                                )
+                                append("\n\n设备性能和首次启动耗时因机型、温度和后台负载而异；请以设备页启动计时为准。")
+                            },
                             buttons = listOf(
                                 GlasmioAlertButtonSpec(
                                     "不再弹出",
@@ -276,7 +282,6 @@ private fun Tabs(
     vm: AppViewModel,
     onOpenLogs: () -> Unit,
     onOpenDiagnostics: () -> Unit,
-    onOpenMcpSettings: () -> Unit,
     onRequestStop: () -> Unit,
 ) {
     // No Crossfade between root tabs: it keeps *both* pages composed while it runs, and every glass
@@ -293,9 +298,14 @@ private fun Tabs(
                 openLogs = onOpenLogs,
                 openLibrary = { vm.selectTab(AppTab.Library) },
                 openScreen = { vm.selectTab(AppTab.Screen) },
-                ignoreStale = vm::ignoreStaleImages,
+                openSettings = { vm.selectTab(AppTab.Settings) },
                 forceCleanup = vm::forceCleanup,
-                openMcpSettings = onOpenMcpSettings,
+                setGpuBackend = vm::setExperimentalGpu,
+                setNet = vm::setNetEnabled,
+                setDataDisk = vm::setDataDisk,
+                // 「固件与镜像位置」点一下复制的是路径本身。旧版这里接的是 copyLog(Serial)，
+                // 复制出来是串口日志——0.31.0 顺手修掉。
+                copyStoragePath = { vm.copyToClipboard(state.artifacts.storagePath, "固件与镜像位置") },
             ),
         )
 
@@ -324,6 +334,7 @@ private fun Tabs(
                 verify = vm::verifyFirmware,
                 compile = vm::compileImages,
                 cancelCompile = vm::cancelCompile,
+                start = vm::startQemu,
                 openDiagnostics = onOpenDiagnostics,
                 openLogs = onOpenLogs,
                 requestStorage = vm::requestStoragePermission,
@@ -339,11 +350,9 @@ private fun Tabs(
                 setHostCores = vm::setHostCores,
                 setMttcg = vm::setMttcg,
                 setAutoFallback = vm::setAutoFallback,
-                setNet = vm::setNetEnabled,
                 setFollow = vm::setFollowLog,
                 forceCleanup = vm::forceCleanup,
                 openDiagnostics = onOpenDiagnostics,
-                copyPath = { vm.copyLog(LogSource.Serial) },
                 copyText = vm::copyToClipboard,
                 setMcpEnabled = vm::setMcpEnabled,
                 setMcpPort = vm::setMcpPort,

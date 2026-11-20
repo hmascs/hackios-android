@@ -5,7 +5,10 @@ import android.util.Log
 import com.android.gudao.iphoneos.engine.AppLog
 import java.io.File
 import java.io.FileOutputStream
+import java.io.IOException
 import java.nio.file.Files
+import java.nio.file.StandardCopyOption.ATOMIC_MOVE
+import java.nio.file.StandardCopyOption.REPLACE_EXISTING
 import java.nio.file.Paths
 import java.util.zip.ZipInputStream
 
@@ -46,6 +49,7 @@ class AssetDeployer(private val context: Context) {
         val ok: Boolean get() = kernel && loader && uefi && vars && qemu && scripts && toolchain
     }
 
+    @Synchronized
     fun deploy(): DeployResult {
         val run = runDir.apply { mkdirs() }
         val esp = File(run, "esp/EFI/BOOT").apply { mkdirs() }
@@ -55,7 +59,7 @@ class AssetDeployer(private val context: Context) {
         val loader = copyAsset(Constants.ASSET_LOADER, loaderFile) &&
                 copyRaw(loaderFile, File(esp, "BOOTAA64.EFI"))   // ESP volume for UEFI
         val uefi = copyAsset(Constants.ASSET_UEFI, File(run, Constants.ASSET_UEFI))
-        val vars = copyAsset(Constants.ASSET_VARS, File(run, Constants.ASSET_VARS))
+        val vars = ensureVarsAsset()
         migrateLegacyLayout(run)
         val qemu = unzipBundle(
             Constants.ASSET_QEMU_BUNDLE, Constants.QEMU_DIR_REL, File(run, Constants.QEMU_BIN_REL)
@@ -354,13 +358,38 @@ class AssetDeployer(private val context: Context) {
      * Shell、屏幕上什么都没有，看起来就是「黑屏卡死」。上游 run-darwin.sh 用
      * QEMU_VARS_RESET=1 重刷一份 64 MiB、全 0xFF 的 vars.fd 解决；这里等价地重拷资产。
      */
+    private fun ensureVarsAsset(): Boolean {
+        val vars = File(runDir, Constants.ASSET_VARS)
+        if (vars.exists()) {
+            if (!vars.isFile || vars.length() != UEFI_VARS_BYTES) {
+                Log.e(TAG, "UEFI Vars size mismatch; refusing to overwrite existing file: ${vars.absolutePath}")
+                return false
+            }
+            return true
+        }
+        return copyAsset(Constants.ASSET_VARS, vars) && vars.length() == UEFI_VARS_BYTES
+    }
+
+    /** Reset UEFI vars only through an explicit, caller-gated operation. */
+    @Synchronized
     fun resetEfiVars(): Boolean {
         val vars = File(runDir.apply { mkdirs() }, Constants.ASSET_VARS)
-        val ok = copyAsset(Constants.ASSET_VARS, vars)
-        if (ok) AppLog.w(TAG, "UEFI NVRAM 已重置：${vars.absolutePath}（丢弃可能导致每次进 EFI Shell 的启动项）")
-        else AppLog.w(TAG, "UEFI NVRAM 重置失败：资产 ${Constants.ASSET_VARS} 缺失")
-        return ok
+        val temp = File(runDir, "${Constants.ASSET_VARS}.reset.tmp")
+        return try {
+            context.assets.open(Constants.ASSET_VARS).use { input ->
+                temp.outputStream().use { output -> input.copyTo(output) }
+            }
+            if (temp.length() != UEFI_VARS_BYTES) throw IOException("Bundled UEFI vars size mismatch")
+            Files.move(temp.toPath(), vars.toPath(), ATOMIC_MOVE, REPLACE_EXISTING)
+            AppLog.w(TAG, "UEFI NVRAM explicitly reset: ${vars.absolutePath}")
+            true
+        } catch (t: Throwable) {
+            runCatching { temp.delete() }
+            Log.e(TAG, "UEFI NVRAM reset failed: ${t.message}")
+            false
+        }
     }
+
 
     /** The unpacked HackiOS scripts (ios165/, userland/, tools/, prebuilt/, xnu-env.sh). */
     fun scriptsDir(): File = File(runDir, Constants.SCRIPTS_DIR_REL)
@@ -442,6 +471,7 @@ class AssetDeployer(private val context: Context) {
      * v17: configd 的 job 名写错：FAST 里传的是 MachService 名
      *     com.apple.SystemConfiguration.configd，而 LaunchDaemon 的 label 是
      *     com.apple.configd，plist 一直没生成；改正后 IMAGE_REV 7→8。 */
+        private const val UEFI_VARS_BYTES = 64L shl 20
         private const val LAYOUT_VERSION = 17
     }
 }

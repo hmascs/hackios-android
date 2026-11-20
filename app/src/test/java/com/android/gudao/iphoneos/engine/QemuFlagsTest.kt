@@ -66,10 +66,29 @@ class QemuFlagsTest {
 
     @Test
     fun `rejects boot args managed by the app`() {
-        for (bad in listOf("cpus=4", "rd=0x1", "epoch=1", "loader_return_after=0")) {
+        for (bad in listOf("cpus=4", "rd=0x1", "epoch=1", "loader_return_after=0", "virtio_blk=1", "virtio_blk=2", "virtio_blk")) {
             val p = QemuFlags.parseBootArgs(bad)
             assertFalse("应该拒绝 $bad", p.ok)
         }
+    }
+
+    @Test
+    fun `GPU writable disk overrides legacy saved block tokens once`() {
+        assertEquals("debug=0x144 glbatch=1 virtio_blk=2",
+            QemuFlags.launchBootArgs("virtio_blk=1 debug=0x144 virtio_blk=0", true, "virtio_blk=2"))
+    }
+
+    @Test
+    fun `GPU disabled disk strips stale block flags and honors batch override`() {
+        assertEquals("glbatch=0 -v",
+            QemuFlags.launchBootArgs("virtio_blk=2 glbatch=0 -v virtio_blk", true, null))
+    }
+
+    @Test
+    fun `read only disk and software backend preserve their own launch choices`() {
+        assertEquals("serial=1 virtio_blk=1", QemuFlags.launchBootArgs("serial=1", false, "virtio_blk=1"))
+        assertEquals("", QemuFlags.launchBootArgs("", false, null))
+        assertEquals("glbatch=1", QemuFlags.launchBootArgs("", true, null))
     }
 
     @Test

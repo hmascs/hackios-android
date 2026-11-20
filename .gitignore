@@ -27,3 +27,6 @@ app/src/main/assets/QEMU_VARS.fd
 app/src/main/assets/qemu-android-bundle.zip
 app/src/main/assets/hackios-toolchain.zip
 app/src/main/assets/mach.development.bcm2837
+
+# Python 缓存
+__pycache__/

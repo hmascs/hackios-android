@@ -3,6 +3,7 @@ package com.android.gudao.iphoneos.state
 import com.android.gudao.iphoneos.Constants
 import com.android.gudao.iphoneos.engine.BootTimeline
 import com.android.gudao.iphoneos.engine.CapturePipeline
+import com.android.gudao.iphoneos.engine.GpuIdentity
 import com.android.gudao.iphoneos.engine.QemuFailure
 import com.android.gudao.iphoneos.mcp.McpConfig
 
@@ -70,6 +71,9 @@ data class SettingsUi(
      * 默认 false —— 每次打开都弹，直到用户明确选择不再弹出。
      */
     val perfGateDismissed: Boolean = false,
+    val dataDiskMode: String = "DISABLED",
+    val dataDiskGiB: Int = 8,
+    val experimentalGpu: Boolean = false,
 )
 
 sealed interface DownloadUi {
@@ -125,7 +129,7 @@ sealed interface BuildUi {
 
 sealed interface QemuUi {
     data object Stopped : QemuUi
-    data class Starting(val step: String) : QemuUi
+    data class Starting(val step: String, val sinceEpochMs: Long = 0L) : QemuUi
     data class Running(
         val sinceEpochMs: Long,
         val smp: Int,
@@ -227,6 +231,10 @@ data class BootTimelineUi(
 data class AppUiState(
     val tab: AppTab = AppTab.Device,
     val settings: SettingsUi = SettingsUi(),
+    /** APK 是否自带 Adreno 运行时（GPU 测试包才有）。 */
+    val experimentalGpuAvailable: Boolean = false,
+    /** 宿主 GPU 识别结果。启动时在 IO 线程查一次，之后只读。 */
+    val gpu: GpuIdentity = GpuIdentity(),
     val artifacts: ArtifactsUi = ArtifactsUi(),
     val download: DownloadUi = DownloadUi.Idle,
     val build: BuildUi = BuildUi.Idle,

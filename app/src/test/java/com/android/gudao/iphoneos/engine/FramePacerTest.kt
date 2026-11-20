@@ -5,98 +5,102 @@ import org.junit.Assert.assertTrue
 import org.junit.Test
 
 /**
- * 0.25.0 CPU 空转修复的验收：取帧调度必须在引导期把核让给 guest，guest 忙时退避，
- * 画面静止时降频，且永远不返回忙循环的 0 间隔。
+ * 取帧调度的验收：引导和桌面都不再被人为降帧，只有「一次取帧过慢」才退避，
+ * 且永远不返回忙循环的 0 间隔。实测帧率由 CapturePipeline 的 fpsEma 汇报，
+ * 这里只断言「允许的最快节奏」。
  */
 class FramePacerTest {
 
     @Test
-    fun `boot stage uses 2 FPS to leave CPU to XNU`() {
-        for (s in 0..5) {
-            assertEquals(
-                "阶段 $s 应该是 2 FPS",
-                FramePacer.BOOT_INTERVAL_MS,
-                FramePacer.nextIntervalMs(s, 0, 0, 0, frames = 10),
-            )
-        }
+    fun `target is 60 fps`() {
+        assertEquals(16L, FramePacer.TARGET_INTERVAL_MS)
+        assertTrue(1000f / FramePacer.TARGET_INTERVAL_MS >= 60f)
     }
 
     @Test
-    fun `first frame ever is probed slowly`() {
+    fun `a fast capture is paced to the target, not slower`() {
+        // 一次 40ms 的 screendump 已经比 16ms 慢；调度不该再额外等待。
         assertEquals(
-            FramePacer.BOOT_INTERVAL_MS,
-            FramePacer.nextIntervalMs(3, 0, 0, 0, frames = 0),
+            FramePacer.TARGET_INTERVAL_MS,
+            FramePacer.nextIntervalMs(lastCaptureMs = 40),
         )
-    }
-
-    @Test
-    fun `active desktop returns to normal 8 FPS`() {
         assertEquals(
-            FramePacer.ACTIVE_INTERVAL_MS,
-            FramePacer.nextIntervalMs(7, 500, 80, changedFrames = 5, frames = 40),
-        )
-    }
-
-    @Test
-    fun `static picture drops to 1 FPS`() {
-        assertEquals(
-            FramePacer.IDLE_INTERVAL_MS,
-            FramePacer.nextIntervalMs(7, 30_000, 80, changedFrames = 5, frames = 200),
-        )
-        // 阶段 6 且从未换过内容（黑屏/静止）也不该 8 FPS 猛压 QEMU
-        assertEquals(
-            FramePacer.IDLE_INTERVAL_MS,
-            FramePacer.nextIntervalMs(6, 30_000, 80, changedFrames = 0, frames = 200),
+            FramePacer.TARGET_INTERVAL_MS,
+            FramePacer.nextIntervalMs(lastCaptureMs = 0),
         )
     }
 
     @Test
     fun `slow screendump backs off instead of piling up`() {
         // 真机日志里出现过 76430ms 的一次取帧；旧循环 125ms 后又发一条，形成雪崩。
-        val paced = FramePacer.nextIntervalMs(7, 500, 76_430, changedFrames = 5, frames = 40)
+        val paced = FramePacer.nextIntervalMs(lastCaptureMs = 76_430)
         assertEquals(FramePacer.BACKOFF_INTERVAL_MS, paced)
-        assertTrue(paced > FramePacer.ACTIVE_INTERVAL_MS)
+        assertTrue(paced > FramePacer.TARGET_INTERVAL_MS)
     }
 
     @Test
-    fun `guest busy backoff wins over active fps`() {
+    fun `backoff wins over the target`() {
         assertEquals(
             FramePacer.BACKOFF_INTERVAL_MS,
-            FramePacer.nextIntervalMs(7, 0, 3_000, changedFrames = 9, frames = 99),
+            FramePacer.nextIntervalMs(lastCaptureMs = 3_000),
         )
     }
 
     @Test
     fun `never returns a busy-loop interval`() {
-        for (stage in 0..7) {
-            for (cost in listOf(0L, 100L, 1_499L, 1_500L, 90_000L)) {
-                assertTrue(
-                    FramePacer.nextIntervalMs(stage, 0, cost, 1, frames = 5) >= FramePacer.MIN_INTERVAL_MS,
-                )
-            }
+        for (cost in listOf(0L, 100L, 1_499L, 1_500L, 90_000L)) {
+            assertTrue(
+                FramePacer.nextIntervalMs(lastCaptureMs = cost) >= FramePacer.MIN_INTERVAL_MS,
+            )
         }
     }
 
     @Test
-    fun `custom normal interval is respected when active`() {
-        assertEquals(
-            250L,
-            FramePacer.nextIntervalMs(7, 100, 50, changedFrames = 2, frames = 10, normalIntervalMs = 250L),
-        )
+    fun `custom normal interval is respected`() {
+        assertEquals(250L, FramePacer.nextIntervalMs(lastCaptureMs = 50, normalIntervalMs = 250L))
+        // 自定义间隔也不能低到忙循环
+        assertEquals(FramePacer.MIN_INTERVAL_MS, FramePacer.nextIntervalMs(lastCaptureMs = 1, normalIntervalMs = 1L))
     }
 
     @Test
     fun `describe covers every pace`() {
         assertTrue(FramePacer.describe(FramePacer.BACKOFF_INTERVAL_MS).contains("退避"))
-        assertTrue(FramePacer.describe(FramePacer.IDLE_INTERVAL_MS).contains("静止"))
-        assertTrue(FramePacer.describe(FramePacer.BOOT_INTERVAL_MS).contains("启动期"))
-        assertTrue(FramePacer.describe(FramePacer.ACTIVE_INTERVAL_MS).contains("活跃"))
+        assertTrue(FramePacer.describe(FramePacer.TARGET_INTERVAL_MS).contains("60 FPS"))
+        assertTrue(FramePacer.describe(FramePacer.TARGET_INTERVAL_MS).contains("实测"))
     }
 
     @Test
-    fun `boot pacing saves most screendump bandwidth`() {
-        // 2 FPS vs 8 FPS = 8MB * 6 次/秒 ≈ 48 MB/s 少写闪存，也少 6 次 HMP 阻塞。
-        val saved = (1000f / FramePacer.ACTIVE_INTERVAL_MS - 1000f / FramePacer.BOOT_INTERVAL_MS) * 8
-        assertTrue("引导期每秒应少约 48MB 的 PPM 写入", saved >= 45f)
+    fun `a static screen drops to four samples per second`() {
+        // 画面 2 秒没变：把主循环让给 TCG，采样降到 250 ms。
+        assertEquals(
+            FramePacer.STATIC_INTERVAL_MS,
+            FramePacer.nextIntervalMs(lastCaptureMs = 40, staticForMs = 2_000L),
+        )
+        assertEquals(
+            FramePacer.STATIC_INTERVAL_MS,
+            FramePacer.nextIntervalMs(lastCaptureMs = 40, staticForMs = 60_000L),
+        )
+    }
+
+    @Test
+    fun `a fresh change goes straight back to the target rate`() {
+        // 刚检测到变化（staticForMs=0）就必须回到 16 ms，否则点了要等 250 ms 才看到反馈。
+        assertEquals(
+            FramePacer.TARGET_INTERVAL_MS,
+            FramePacer.nextIntervalMs(lastCaptureMs = 40, staticForMs = 0L),
+        )
+        assertEquals(
+            FramePacer.TARGET_INTERVAL_MS,
+            FramePacer.nextIntervalMs(lastCaptureMs = 40, staticForMs = 1_999L),
+        )
+    }
+
+    @Test
+    fun `a slow capture still wins over a static screen`() {
+        // 两条退避规则同时命中时，guest 忙的保护优先，避免 76 秒那种堆积。
+        assertEquals(
+            FramePacer.BACKOFF_INTERVAL_MS,
+            FramePacer.nextIntervalMs(lastCaptureMs = 3_000, staticForMs = 60_000L),
+        )
     }
 }

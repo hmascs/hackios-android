@@ -11,7 +11,11 @@ import com.android.gudao.iphoneos.engine.QemuTopology
  */
 object Constants {
 
-    /** Application package name, as requested. */
+    /**
+     * 安装包名，必须与 `build.gradle.kts` 的 `applicationId` 一致（那里是唯一来源，
+     * 这里只是给日志/界面用的字符串副本；不要用它拼 provider authority，那个要跟
+     * `Context.packageName` 走，否则改名后会失效）。
+     */
     const val PACKAGE_NAME = "com.android.gudao.iphoneos"
 
     // ---- Apple CDN firmware (iPhone X, iOS 16.5 build 20F66) -------------------------------
@@ -93,17 +97,49 @@ object Constants {
     const val MON_PORT = 4444                  // HMP monitor (screendump)
     const val LOADER_ADDR = 0xF0000000L        // payload.bin load address
 
-    // Phone screen within the guest display mode (HackiOS crops the top-left corner of this size).
-    const val SCREEN_W = 1125
-    const val SCREEN_H = 2436
+    // ---------------------------------------------------------------------------------------
+    // 渲染倍率
+    //
+    // 来宾的帧缓冲尺寸由两个数决定，而两者必须一致，否则合成结果落不进 ramfb、屏幕全黑：
+    //  - payload cmdline 的 `fbscale=N`（WindowServer 按 N 倍建图）；
+    //  - loader.efi 通过 fw_cfg "etc/ramfb" 交给 QEMU 的 ramfb 尺寸（loader 里目前是编死的
+    //    1125×2436 = 375×812 @3x）。
+    //
+    // 3 是 iPhone X 的原生倍率；2 给 750×1624（4/9 像素），1 给 375×812（1/9 像素）。
+    // 在 TCG 里来宾的光栅化、以及把画面写进 panel 的那次拷贝都与像素面积成正比，所以这是
+    // 「不带来宾改动」唯一能乘上去的杠杆：面积 1/9，面积相关成本就是 1/9。
+    //
+    // 默认保持 3 —— 与已发布的 0.31.3 完全一致的行为。降到 2/1 的前提是两件事同时成立：
+    // worker 帧环按同一尺寸建（App 侧用下面的 SCREEN_W/H），且来宾不因为 ramfb 尺寸不匹配
+    // 而停手。后者决定要不要去改 loader.efi，实测见 docs/gl-frame-ring.md。
+    // ---------------------------------------------------------------------------------------
+    const val SCREEN_SCALE = 3
+    const val SCREEN_POINT_W = 375               // iPhone X 的点尺寸
+    const val SCREEN_POINT_H = 812
+    const val SCREEN_W = SCREEN_POINT_W * SCREEN_SCALE    // 1125 = 0.31.3 的原值
+    const val SCREEN_H = SCREEN_POINT_H * SCREEN_SCALE    // 2436
 
     // Live display: poll the guest framebuffer over HMP `screendump` and repaint the SurfaceView.
-    // 8 FPS, deliberately lower than the old 15: once the loader has negotiated 1125x2436, every
-    // screendump writes an 8.2 MB PPM through the phone's flash, and 15 FPS meant ~123 MB/s of
-    // writes that QEMU's single TCG thread then competes with. 8 FPS is still smooth for a boot
-    // demo and halves that pressure. Raise it only if the decode path stops being the bottleneck.
-    const val FB_FPS = 8
-    const val FB_INTERVAL_MS = 1000L / FB_FPS          // 125 ms between frames
+    // 0.32.0: the old 8 FPS cap is gone, so boot and desktop share one 60 FPS request budget.
+    // This is a target, not a promise: one screendump + PPM decode measured ~40–56 ms on this
+    // phone (≈18 samples/s), and the Adreno path's full-frame readback is slower still, so the
+    // pipeline reports the measured fps instead of assuming the target. It never sleeps to
+    // "catch up": if a capture already takes longer than 16 ms, the next one starts immediately.
+    const val FB_FPS = 60
+    const val FB_INTERVAL_MS = 1000L / FB_FPS          // 16 ms between frames, as a minimum
+
+    /**
+     * Worker GL-surface readback tap. This is NOT the final display producer:
+     * Redwood reads multiple drawn targets before MiniFramebuffer composes the
+     * layers into the panel. Matching panel dimensions do not establish scanout
+     * identity, and an HFR2 guard only makes that intermediate copy consistent.
+     *
+     * Keep direct App display disabled until a producer is tied to final panel
+     * presentation. The App uses full-resolution QEMU framebuffer capture;
+     * isolated diagnostic harnesses may still collect the worker ring. Guest
+     * IOSurface pixel writeback remains mandatory in either mode.
+     */
+    const val FRAME_RING_ENABLED = false
 
     const val DEFAULT_SESSION_SECS = 1200      // 20 minutes, like the upstream default
 
@@ -167,6 +203,10 @@ object Constants {
     const val PUBLIC_HACKIOS_DIR = "hackios"
     const val PUBLIC_IPSW_SUBDIR = "ipsw"
     const val PUBLIC_IMAGES_SUBDIR = "images"
+    // Stable public location for the optional iOS data disk, separate from firmware and RAM.
+    const val PUBLIC_DISKS_SUBDIR = "disks"
+    const val IOS_DATA_DISK_NAME = "ios-data.qcow2"
+    const val IOS_DATA_DISK_BYTES = 8L shl 30
 
     // Names of the iOS images produced by the host prepare script (hackios-host-prepare.sh).
     const val IMG_SYSTEM = "system.apfs"

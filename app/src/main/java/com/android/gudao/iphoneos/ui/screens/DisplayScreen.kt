@@ -20,6 +20,7 @@ import androidx.compose.foundation.layout.aspectRatio
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
@@ -50,6 +51,7 @@ import androidx.compose.ui.unit.dp
 import com.android.gudao.iphoneos.Constants
 import com.android.gudao.iphoneos.engine.CapturePipeline
 import com.android.gudao.iphoneos.engine.QemuTopology
+import com.android.gudao.iphoneos.engine.TouchGesture
 import com.android.gudao.iphoneos.engine.TouchMapper
 import com.android.gudao.iphoneos.state.AppUiState
 import com.android.gudao.iphoneos.state.QemuUi
@@ -125,13 +127,42 @@ fun DisplayScreen(
 
     Box(modifier.fillMaxSize().testTag("screen_display")) {
         if (!running) {
-            EmptyState(
-                glyph = Glyph.Screen,
-                title = "QEMU 没有运行",
-                message = "启动后这里会实时显示 iOS 的画面，可直接触摸操作。",
-                actionLabel = "启动 iOS",
-                onAction = onStart,
-            )
+            // 启动中 / 失败也是「没有画面」，但旧文案一律说「QEMU 没有运行」并把「启动 iOS」
+            // 再摆出来——启动中再点一次没有反应，失败后再点一次只会再失败。按真实状态分开。
+            when (val q = state.qemu) {
+                is QemuUi.Starting -> EmptyState(
+                    glyph = Glyph.Screen,
+                    title = "正在启动 iOS",
+                    message = "${q.step}。画面出现前可以先看日志，或留在这里等待。",
+                    actionLabel = "查看日志",
+                    onAction = onOpenLogs,
+                )
+
+                is QemuUi.Failed -> EmptyState(
+                    glyph = Glyph.Alert,
+                    title = q.failure.title,
+                    message = q.failure.hint
+                        ?: "${q.failure.detail}。回到设备页查看原因与下一步。",
+                    actionLabel = "回到设备页",
+                    onAction = onExit,
+                )
+
+                is QemuUi.StaleImages -> EmptyState(
+                    glyph = Glyph.Alert,
+                    title = "镜像版本不一致",
+                    message = "公共目录里的镜像需要重新编译，回到设备页可以查看原因并开始编译。",
+                    actionLabel = "回到设备页",
+                    onAction = onExit,
+                )
+
+                else -> EmptyState(
+                    glyph = Glyph.Screen,
+                    title = "QEMU 没有运行",
+                    message = "启动后这里会实时显示 iOS 的画面，可直接触摸操作。",
+                    actionLabel = "启动 iOS",
+                    onAction = onStart,
+                )
+            }
         } else {
             // ---- guest screen ----
             // The screen sits *between* the two chrome bars instead of behind them. It used to be
@@ -154,23 +185,47 @@ fun DisplayScreen(
                         .pointerInput(running) {
                             awaitEachGesture {
                                 val down = awaitFirstDown(requireUnconsumed = false)
+                                if (down.isConsumed) {
+                                    while (true) {
+                                        val consumedEvent = awaitPointerEvent()
+                                        val consumedChange = consumedEvent.changes.firstOrNull { it.id == down.id } ?: break
+                                        if (!consumedChange.pressed) break
+                                    }
+                                    return@awaitEachGesture
+                                }
                                 val w = size.width.toFloat()
                                 val h = size.height.toFloat()
-                                fun map(o: Offset): Pair<Float, Float>? =
+                                fun map(o: Offset): com.android.gudao.iphoneos.engine.GuestPoint? =
                                     TouchMapper.toGuest(w, h, Constants.SCREEN_W, Constants.SCREEN_H, o.x, o.y)
-                                        ?.let { it.x to it.y }
-
-                                map(down.position)?.let { (x, y) -> onTouchDown(x, y) }
-                                while (true) {
-                                    val event = awaitPointerEvent()
-                                    val change = event.changes.firstOrNull { it.id == down.id } ?: break
-                                    if (change.pressed) {
-                                        map(change.position)?.let { (x, y) -> onTouchMove(x, y) }
-                                        change.consume()
-                                    } else {
-                                        map(change.position)?.let { (x, y) -> onTouchUp(x, y) }
-                                        break
+                                fun dispatch(event: TouchGesture.Event) {
+                                    when (event.kind) {
+                                        TouchGesture.Kind.Down -> onTouchDown(event.point.x, event.point.y)
+                                        TouchGesture.Kind.Move -> onTouchMove(event.point.x, event.point.y)
+                                        TouchGesture.Kind.Up -> onTouchUp(event.point.x, event.point.y)
                                     }
+                                }
+
+                                val gesture = TouchGesture()
+                                try {
+                                    val initial = gesture.down(map(down.position))
+                                    if (initial.isEmpty()) return@awaitEachGesture
+                                    down.consume()
+                                    initial.forEach(::dispatch)
+                                    while (gesture.isActive) {
+                                        val event = awaitPointerEvent()
+                                        val change = event.changes.firstOrNull { it.id == down.id } ?: break
+                                        if (change.pressed) {
+                                            gesture.move(map(change.position)).forEach(::dispatch)
+                                            change.consume()
+                                        } else {
+                                            gesture.up(map(change.position)).forEach(::dispatch)
+                                            break
+                                        }
+                                    }
+                                } finally {
+                                    // Dragging outside the aspect-correct guest rectangle, pointer loss,
+                                    // QEMU stopping or pointerInput cancellation must not leave BTN_LEFT down.
+                                    gesture.cancel().forEach(::dispatch)
                                 }
                             }
                         },
@@ -213,8 +268,12 @@ fun DisplayScreen(
                         if (chrome) {
                             Row(
                                 Modifier
+                                    .heightIn(min = 44.dp)
                                     .clip(CircleShape)
                                     .background(Color.Black.copy(alpha = 0.28f))
+                                    // The whole capsule opens the sheet: the old 12sp 更多 text
+                                    // was the only target and measured ~28dp.
+                                    .clickable { sheet = true }
                                     .padding(horizontal = 10.dp, vertical = 6.dp),
                                 verticalAlignment = Alignment.CenterVertically,
                             ) {
@@ -225,7 +284,10 @@ fun DisplayScreen(
                                 )
                                 Spacer(Modifier.width(8.dp))
                                 Text(
-                                    "${capture.resolution} · ${"%.0f".format(capture.fps)} fps",
+                                    // 采样率与内容帧率必须同时显示：20 FPS 的目标看后者。
+                                    "${capture.resolution} · " +
+                                        "${"%.0f".format(capture.fps)} 采样 / " +
+                                        "${"%.1f".format(capture.contentFps)} 内容 fps",
                                     style = IosTypography.caption2,
                                     color = Color.White.copy(alpha = 0.85f),
                                 )
@@ -234,9 +296,7 @@ fun DisplayScreen(
                                     "更多",
                                     style = IosTypography.caption2,
                                     color = accents.blue,
-                                    modifier = Modifier
-                                        .testTag("btn_display_more")
-                                        .clickable { sheet = true },
+                                    modifier = Modifier.testTag("btn_display_more"),
                                 )
                             }
                         }
@@ -248,6 +308,7 @@ fun DisplayScreen(
                         if (running && capture.health == CapturePipeline.Health.Live && stalledFor >= STALL_NOTICE_MS) {
                             Row(
                                 Modifier
+                                    .heightIn(min = 44.dp)
                                     .clip(CircleShape)
                                     .background(accents.orange.copy(alpha = 0.18f))
                                     .padding(horizontal = 12.dp, vertical = 7.dp),
@@ -281,6 +342,7 @@ fun DisplayScreen(
                         ) {
                             Row(
                                 Modifier
+                                    .heightIn(min = 44.dp)
                                     .clip(CircleShape)
                                     .background(accents.orange.copy(alpha = 0.18f))
                                     .padding(horizontal = 12.dp, vertical = 7.dp),
@@ -310,11 +372,14 @@ fun DisplayScreen(
                             Modifier
                                 .align(Alignment.TopStart)
                                 .padding(start = 12.dp, top = 12.dp)
+                                .size(44.dp)
                                 .clip(CircleShape)
                                 .background(Color.Black.copy(alpha = 0.3f))
                                 .clickable { onExit() }
-                                .padding(8.dp)
+                                .semantics { contentDescription = "返回设备页" }
                                 .testTag("btn_exit_screen"),
+                            horizontalArrangement = Arrangement.Center,
+                            verticalAlignment = Alignment.CenterVertically,
                         ) {
                             IosGlyph(
                                 Glyph.ChevronRight,
@@ -356,11 +421,13 @@ fun DisplayScreen(
                     Modifier
                         .align(Alignment.BottomEnd)
                         .padding(end = 20.dp, bottom = bottomInset + 8.dp)
+                        .size(44.dp)
                         .clip(CircleShape)
                         .background(Color.Black.copy(alpha = 0.3f))
                         .clickable { chrome = true }
-                        .padding(10.dp)
+                        .semantics { contentDescription = "显示控制条" }
                         .testTag("btn_show_chrome"),
+                    contentAlignment = Alignment.Center,
                 ) {
                     IosGlyph(Glyph.ChevronRight, size = 18.dp, tint = Color.White)
                 }
@@ -382,6 +449,14 @@ fun DisplayScreen(
                 sheet = false
                 onOpenLogs()
             })
+            GlasmioListRow(
+                "取帧 ${capture.captureMs} ms（截屏 ${capture.dumpMs} / 解码 ${capture.decodeMs}）",
+                onClick = { sheet = false },
+            )
+            GlasmioListRow(
+                "采样 ${"%.1f".format(capture.fps)} fps · 内容 ${"%.1f".format(capture.contentFps)} fps",
+                onClick = { sheet = false },
+            )
             GlasmioListRow("隐藏控制条", onClick = {
                 sheet = false
                 chrome = false

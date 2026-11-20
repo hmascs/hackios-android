@@ -32,7 +32,7 @@ object QemuFlags {
             "-no-shutdown、-singlestep、-gdb tcp::<端口>"
 
     val BOOT_ARG_HELP = "只允许 key=value 形式（如 debug=0x144 serial=1）或 -v；" +
-        "cpus= / rd= / epoch= / loader_return_after= 由 App 管理，不能改"
+        "cpus= / rd= / epoch= / loader_return_after= / virtio_blk= 由 App 管理，不能改"
 
     private val SAFE_ITEM = Regex("^[A-Za-z0-9_,+.-]+$")
     private val SAFE_FILE = Regex("^[A-Za-z0-9._-]+$")
@@ -40,7 +40,18 @@ object QemuFlags {
     private val BOOT_TOKEN = Regex("^[A-Za-z0-9_.-]+(=([A-Za-z0-9_.,:/@+\\[\\]-]*))?$")
 
     /** 这些 boot-arg 由 App 按界面设置写入，模型再写一遍会造成两个来源打架。 */
-    private val MANAGED_BOOT_KEYS = setOf("cpus", "rd", "epoch", "loader_return_after")
+    private val MANAGED_BOOT_KEYS = setOf("cpus", "rd", "epoch", "loader_return_after", "virtio_blk")
+
+    /** Old saved settings may contain a block flag from before the App managed it. */
+    fun launchBootArgs(raw: String, adreno: Boolean, storageBootArg: String?): String {
+        require(storageBootArg == null || storageBootArg in setOf("virtio_blk=1", "virtio_blk=2"))
+        val tokens = raw.split(Regex("\\s+")).filter { it.isNotBlank() && it.substringBefore('=') != "virtio_blk" }
+        val userSetsBatch = tokens.any { it.substringBefore('=') == "glbatch" }
+        return (tokens + listOfNotNull(
+            "glbatch=1".takeIf { adreno && !userSetsBatch },
+            storageBootArg,
+        )).joinToString(" ")
+    }
 
     private const val MAX_RAW = 240
     private const val MAX_ARGS = 10

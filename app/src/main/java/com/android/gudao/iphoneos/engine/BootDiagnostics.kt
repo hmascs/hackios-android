@@ -46,6 +46,9 @@ object BootDiagnostics {
         val meanBrightness: Int = -1,
         val resolution: String = "—",
         val captureMs: Long = 0L,
+        val dumpMs: Long = 0L,
+        val decodeMs: Long = 0L,
+        val contentFps: Float = 0f,
         val intervalMs: Long = 125L,
         val framePace: String = "—",
         val unchangedForMs: Long = 0L,
@@ -99,7 +102,9 @@ object BootDiagnostics {
             "last=${f(s.serialLastLine ?: "—")}")
         out += row(t, "FRAME",
             "frames=${s.frames}", "changed=${s.changedFrames}", "mean=${s.meanBrightness}",
-            "res=${f(s.resolution)}", "capture=${s.captureMs}ms", "interval=${s.intervalMs}ms",
+            "res=${f(s.resolution)}", "capture=${s.captureMs}ms",
+            "dump=${s.dumpMs}ms", "decode=${s.decodeMs}ms",
+            "content=${"%.1f".format(s.contentFps)}fps", "interval=${s.intervalMs}ms",
             "pace=${f(s.framePace)}", "unchanged=${secs(s.unchangedForMs)}s")
         out += row(t, "CPU",
             "vcpu=${s.guestVcpu}", "hostPool=${s.hostCores}", "tb=${s.tbSizeMiB}MiB",

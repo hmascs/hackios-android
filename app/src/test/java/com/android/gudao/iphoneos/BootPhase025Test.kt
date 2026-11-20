@@ -24,14 +24,16 @@ class BootPhase025Test {
     }
 
     @Test
-    fun `lsd CPU monitor storm is reported as non-blocking noise`() {
+    fun `CPU monitor denials are not reported as launchd service lookup failures`() {
         val log = """
             process lsd[25] denied attempt to escape CPU monitor (missing required entitlement).
             com.apple.xpc.launchd| (user/501) <Warning>: failed lookup: name = com.apple.mobileactivationd, requestor = lsd[25], error = 3: No such process
         """.trimIndent()
         val r = BootPhase.analyze(log)
         assertNotNull(r.noise)
-        assertTrue(r.noise!!.contains("非阻塞"))
+        assertTrue(r.noise!!.contains("不同事件"))
+        assertTrue(BootPhase.analyze("process lsd[25] CPU monitor self-denials: 8 total (repeated messages condensed).")
+            .noise!!.contains("不同事件"))
     }
 
     @Test

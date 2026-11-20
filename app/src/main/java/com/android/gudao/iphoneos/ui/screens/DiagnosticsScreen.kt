@@ -47,7 +47,9 @@ fun DiagnosticsScreen(
         modifier = modifier.testTag("screen_diagnostics"),
     ) { padding ->
         Column(Modifier.fillMaxSize().padding(padding)) {
-            GlassPanel(Modifier.padding(horizontal = 16.dp)) {
+            // `padding` from GlasmioPinnedPage already includes the 16dp page inset; the extra
+            // 16dp here (and 20dp on the label) misaligned the card, the label and the results.
+            GlassPanel {
                 Row(verticalAlignment = Alignment.CenterVertically) {
                     IosGlyph(Glyph.Terminal, size = 20.dp, tint = accents.blue)
                     Column(Modifier.weight(1f).padding(start = 10.dp)) {
@@ -70,10 +72,10 @@ fun DiagnosticsScreen(
             }
 
             Spacer(Modifier.height(12.dp))
-            SectionLabel("结果", Modifier.padding(horizontal = 20.dp))
+            SectionLabel("结果")
             LazyColumn(
                 Modifier.fillMaxSize(),
-                contentPadding = PaddingValues(horizontal = 16.dp, vertical = 4.dp),
+                contentPadding = PaddingValues(horizontal = 0.dp, vertical = 4.dp),
                 verticalArrangement = Arrangement.spacedBy(2.dp),
             ) {
                 items(diag.lines) { line ->

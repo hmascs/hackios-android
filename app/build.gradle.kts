@@ -3,12 +3,24 @@ plugins {
     id("org.jetbrains.kotlin.plugin.compose")
 }
 
+val gpuTest = providers.gradleProperty("gpuTest").orNull == "true"
+
 android {
+    if (gpuTest) {
+        val gpuAssets = providers.gradleProperty("gpuAssetsDir")
+            .map { file(it) }
+            .getOrElse(layout.projectDirectory.dir("src/gpuTest/assets").asFile)
+        listOf("gpu-android-arm64.zip", "gpu-libredwood-gl.dylib", "gpu-stage-archive.py").forEach {
+            require(gpuAssets.resolve(it).isFile) { "Missing experimental GPU asset: $it" }
+        }
+        sourceSets.getByName("main").assets.srcDir(gpuAssets)
+    }
     namespace = "com.android.gudao.iphoneos"
     compileSdk = 37
     buildToolsVersion = "37.0.0"
 
     defaultConfig {
+        // Restore the original HackiOS application identity for the 0.4 release.
         applicationId = "com.android.gudao.iphoneos"
         // Glasmio (iOS 27 Liquid Glass) requires API 33; the app is an Android 13+ deliverable.
         minSdk = 33
@@ -47,8 +59,46 @@ android {
         // 掩码（`taskset c0`），不认 util-linux 的 `-c 6-7`；旧探测只按 util-linux 试，于是在
         // 绝大多数手机上首轮就失败、整体降级。现在两种语法都试，并用子进程打印的
         // Cpus_allowed_list 验证「真的钉住了」而不是只看退出码。
-        versionCode = 51
-        versionName = "0.30"
+        // 0.30.0：内核资产换成带 bootlog 叠层的重建内核（SHA-256 7b1f9083…），托管 cmdline
+        // 追加 bootlog=1；旧 payload 由 CMDLINE_PROFILE=6 强制重烘。取帧上限同时从 8 FPS 提到 60。
+        // 0.30.1：Adreno 材料（stage.tar / root-gpu.apfs / dylib）与 materials.txt 全部发布到
+        // /storage/emulated/0/Download/hackios/gpu/adreno-v2/<key>/，清 App 数据后仍可复用。
+        // 0.31.0：首页承载驱动与存储。系统渲染后端改成两档下拉（OSMesa / Adreno），启动时用
+        // EGL 读 GL_RENDERER 识别 GPU：只有高通 Adreno 8xx 能选 Adreno，8xx 非 830 先提示
+        // 「理论上 8XX 通用，但仅在 830 上实测」。导入驱动功能整体删除。guest 画面不再叠加
+        // 串口日志（cmdline 去掉 bootlog=1，CMDLINE_PROFILE 升 7 强制重烘 payload）。
+        // 0.31.1：UI 一致性/操作审查（docs/ui-review-0.31.1.md）。修可写盘选不中、改容量偷换模式、
+        // 启动中按钮可点、屏幕页状态文案错误、危险操作无确认等；补齐主流程入口。不改 QEMU 参数。
+        // 0.31.2：把「画面到底有多快」变成可测量的数。取帧耗时拆成 QEMU 截屏（dump）与 App
+        // 解码（decode）两段单独显示；新增内容帧率（3 秒窗口内画面指纹变化次数 ÷ 实际窗口时长），
+        // 和采样率分开显示——用户要的 20 FPS 指内容帧率，采样 18 帧/秒不代表画面在动。
+        // 不改 QEMU 参数、不改 payload，只加度量。
+        // 0.31.3：画面静止 2 秒后采样从 60 FPS 目标降到 4 次/秒（FramePacer.STATIC_*），
+        // 画面一变立刻回到 16 ms。来宾 0.1–0.3 FPS 时 99% 的采样都是同一张图，
+        // 每次都要 QEMU 主循环写 8 MB PPM + App 读回解码，纯属和 TCG 抢主循环。
+        // 不改 QEMU 参数、不改 payload；只改采样节奏，诊断面板会显示「静止降采样」。
+        // 0.31.4：A6 帧环。worker 每帧渲染完直接把 BGRA 帧写进 App 建的帧环文件，
+        // 来宾侧不再收像素（`EA_READ_RGBA` 带 NO_REPLY，回复只剩 64 字节头）。
+        // 依据是实测：单帧 2.03 s 里 copy-out 占 1.32 s，而它 1.55 s 的原始耗时**不是像素处理**
+        // （逐字节 swap 只占 2.9%、32 位字化只省 12 ms），是 ~7000 个 1500 B 包走
+        // guestfwd→slirp→virtio-net→来宾内核 TCP，~220 µs/包。减少字节动不了它，只能让像素不跨界。
+        // 同时 App 不再 screendump/写读 PPM/逐像素解码（每帧 56 ms，且占 QEMU 主循环）。
+        // 0.31.6：**差分回写**。surface 必须每帧等于完整帧（CA 会把它当纹理上传），但不需要
+        // 每帧传 10.9 MB：宿主按 16 行一带 memcmp，只把变化的行带 + 行号表发回来宾，来宾按
+        // y*stride 拷行。桌面典型帧只变一小块，回写从 1.77 s 降到几百毫秒。
+        // 正确性由「把 delta 应用到上一帧 == 整帧」的模型测试钉住（test-eagl-delta.py）。
+        // 顺带修正：生产路径改为带 SWAP 请求，帧环里从此是真正的 BGRA（此前 flags=0 时是 RGBA，
+        // App 按 ARGB 读会把红蓝读反）。
+        // 0.31.8：即开即用修复（基于 docs/first-run-audit.md）——Adreno 前置条件失败时自动回退
+        // OSMesa 并明示原因，而不是给一个必然重复失败的「重试」；设置页的启动预算文案改为读
+        // BootTimeline 常量（此前写死 90s/180s，与真实的 60s/600s 矛盾，正常慢启动被误判超预算）。
+        // 0.31.5 修正：**不再跳过回写**。0.31.4 真机实测出现「图标一个一个冒出、界面绘制闪烁、
+        // 不知名黑块」——CA 会把合成结果回写进 IOSurface，下一帧再把这个 IOSurface 当纹理上传，
+        // 不回写就等于上传旧内容。所以像素必须继续同步到 surface；帧环只负责「App 怎么拿到帧」，
+        // 它与「像素要不要回给来宾」是两件事。回写的传输成本（7000 个包）留给差分/影子纹理解决。
+        // 详见 docs/gl-frame-ring.md 的「跳过回写为什么关掉」。
+        versionCode = 68
+        versionName = "0.4"
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
     }
 

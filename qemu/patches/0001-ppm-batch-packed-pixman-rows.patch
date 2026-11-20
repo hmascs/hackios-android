@@ -1,0 +1,51 @@
+--- a/ui/ui-qmp-cmds.c
++++ b/ui/ui-qmp-cmds.c
+@@ -295,7 +295,11 @@
+     int height = pixman_image_get_height(image);
+     g_autoptr(Object) ioc = OBJECT(qio_channel_file_new_fd(fd));
+     g_autofree char *header = NULL;
+-    g_autoptr(pixman_image_t) linebuf = NULL;
++    g_autoptr(pixman_image_t) band = NULL;
++    const int band_rows = 32;
++    size_t row_bytes = (size_t)width * 3;
++    size_t stride;
++    uint8_t *data;
+     int y;
+ 
+     trace_ppm_save(fd, image);
+@@ -306,12 +310,29 @@
+         return false;
+     }
+ 
+-    linebuf = qemu_pixman_linebuf_create(PIXMAN_BE_r8g8b8, width);
+-    for (y = 0; y < height; y++) {
+-        qemu_pixman_linebuf_fill(linebuf, image, width, 0, y);
+-        if (qio_channel_write_all(QIO_CHANNEL(ioc),
+-                                  (char *)pixman_image_get_data(linebuf),
+-                                  pixman_image_get_stride(linebuf), errp) < 0) {
++    band = pixman_image_create_bits(PIXMAN_BE_r8g8b8, width,
++                                    MIN(band_rows, height), NULL, 0);
++    if (!band) {
++        error_setg(errp, "Unable to allocate PPM conversion buffer");
++        return false;
++    }
++    stride = pixman_image_get_stride(band);
++    data = (uint8_t *)pixman_image_get_data(band);
++
++    /* PPM has no line padding. Compact Pixman's aligned rows in-place, then
++     * write a band at a time instead of entering the kernel for every row. */
++    for (y = 0; y < height; y += band_rows) {
++        int rows = MIN(band_rows, height - y);
++
++        pixman_image_composite32(PIXMAN_OP_SRC, image, NULL, band,
++                                 0, y, 0, 0, 0, 0, width, rows);
++        if (stride != row_bytes) {
++            for (int r = 1; r < rows; r++) {
++                memmove(data + r * row_bytes, data + r * stride, row_bytes);
++            }
++        }
++        if (qio_channel_write_all(QIO_CHANNEL(ioc), (char *)data,
++                                  row_bytes * rows, errp) < 0) {
+             return false;
+         }
+     }

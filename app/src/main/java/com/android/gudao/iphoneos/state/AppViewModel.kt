@@ -13,6 +13,8 @@ import com.android.gudao.iphoneos.BootPhase
 import com.android.gudao.iphoneos.Constants
 import com.android.gudao.iphoneos.DownloadPowerLock
 import com.android.gudao.iphoneos.FirmwareDownloader
+import com.android.gudao.iphoneos.GpuProbe
+import com.android.gudao.iphoneos.GpuRuntime
 import com.android.gudao.iphoneos.ImageBuilder
 import com.android.gudao.iphoneos.QemuControl
 import com.android.gudao.iphoneos.QemuRunner
@@ -30,6 +32,9 @@ import com.android.gudao.iphoneos.engine.BootDiagnostics
 import com.android.gudao.iphoneos.engine.BootErrorCatalog
 import com.android.gudao.iphoneos.engine.BootTimeline
 import com.android.gudao.iphoneos.engine.CapturePipeline
+import com.android.gudao.iphoneos.engine.FrameRing
+import com.android.gudao.iphoneos.IosDataStorage
+import com.android.gudao.iphoneos.engine.VmDrivers
 import com.android.gudao.iphoneos.engine.FramebufferProbe
 import com.android.gudao.iphoneos.engine.CrashGuard
 import com.android.gudao.iphoneos.engine.LogExporter
@@ -40,6 +45,7 @@ import com.android.gudao.iphoneos.engine.QemuFailureKind
 import com.android.gudao.iphoneos.engine.QemuFlags
 import com.android.gudao.iphoneos.engine.QemuPreflight
 import com.android.gudao.iphoneos.engine.QemuTopology
+import com.android.gudao.iphoneos.engine.ResourceOperationLease
 import com.android.gudao.iphoneos.engine.TailText
 import com.android.gudao.iphoneos.ui.Fmt
 import kotlinx.coroutines.CancellationException
@@ -87,7 +93,17 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
      */
     private val crashTail = LogTailer(CrashGuard.file(deployer.runDirectory()))
 
-    private val _state = MutableStateFlow(AppUiState(settings = settingsRepo.load()))
+    private val GPU_RECOVERY = "可在首页把系统渲染后端切回 OSMesa 再启动；Adreno 启动不会自动回退。请导出日志反馈。"
+    private val gpuAvailable = GpuRuntime.available(app)
+    private val _state = MutableStateFlow(
+        settingsRepo.load().let { saved ->
+            AppUiState(
+                // 还没查 GPU 之前不能确认 Adreno 可用；识别完成后再决定是否恢复上次的选择。
+                settings = saved.copy(experimentalGpu = false),
+                experimentalGpuAvailable = gpuAvailable,
+            )
+        }
+    )
     val state: StateFlow<AppUiState> = _state.asStateFlow()
 
     /** 一次启动的分段计时。UI / MCP / 日志导出读的是同一个实例，不会出现三套数字。 */
@@ -142,6 +158,41 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
     private var qemuJob: Job? = null
     private var watcher: Job? = null
 
+    /** One synchronous gate spans UI and MCP entry points; reserve before launching any worker. */
+    private val resourceOperationGate = Any()
+    private val resourceOperations = ResourceOperationLease()
+
+    private fun reserveResourceOperation(
+        operation: ResourceOperationLease.Operation,
+        extraBusy: () -> Boolean = { false },
+        onReserved: () -> Unit = {},
+    ): ResourceOperationLease.Token? = synchronized(resourceOperationGate) {
+        val token = resourceOperations.tryAcquire(operation) {
+            isQemuRunning() || _state.value.qemu is QemuUi.Starting ||
+                _state.value.build is BuildUi.Running || _state.value.diagnostics.running ||
+                buildJob?.isActive == true || qemuJob?.isActive == true || runner.isRunning() || extraBusy()
+        }
+        if (token != null) {
+            try {
+                onReserved()
+            } catch (t: Throwable) {
+                resourceOperations.release(token)
+                throw t
+            }
+        }
+        token
+    }
+
+    private fun portsClearForResourceWrite(): Boolean =
+        runCatching { QemuPreflight.busyPorts().isEmpty() }.getOrDefault(false)
+
+    private fun finishResourceOperation(
+        token: ResourceOperationLease.Token,
+        cleanup: () -> Unit = {},
+    ): Boolean = synchronized(resourceOperationGate) {
+        resourceOperations.finish(token, cleanup)
+    }
+
     // ---- MCP 端口 ------------------------------------------------------------------------------
     /**
      * 整条链路的工具都挂在 [toolBox] 上，权限档由 [QemuBridge] 从当前配置实时读取——
@@ -165,6 +216,7 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
     init {
         AppLog.attach(deployer.runDirectory())
         refreshArtifacts()
+        detectGpu()
         viewModelScope.launch {
             capture.snapshot.collect { snap ->
                 // 8 frames/s must not become 8 recompositions/s of the whole app. Health changes and
@@ -188,6 +240,29 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         }
     }
 
+    /**
+     * 查一次宿主 GPU（EGL pbuffer，几十毫秒内），并把上次保存的 Adreno 选择恢复回来。
+     *
+     * 恢复必须发生在识别之后：把 experimentalGpu=true 写进初始状态再异步撤销，中间那一帧界面
+     * 会显示一个当前设备根本不支持的档位。
+     */
+    private fun detectGpu() {
+        val saved = settingsRepo.load()
+        viewModelScope.launch(Dispatchers.IO) {
+            val gpu = runCatching { GpuProbe.query() }.getOrDefault(com.android.gudao.iphoneos.engine.GpuIdentity())
+            val allowed = gpuAvailable && gpu.isAdreno8xx
+            val restore = allowed && saved.experimentalGpu
+            if (!restore && saved.experimentalGpu) settingsRepo.setExperimentalGpu(false)
+            _state.update {
+                it.copy(
+                    gpu = gpu,
+                    settings = it.settings.copy(experimentalGpu = restore),
+                )
+            }
+            Log.i(TAG, "gpu: ${gpu.summary} source=${gpu.source} adreno8xx=${gpu.isAdreno8xx}")
+        }
+    }
+
     // ---- intents: navigation & settings ---------------------------------------------------------
 
     fun selectTab(tab: AppTab) {
@@ -199,15 +274,86 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         }
     }
 
+    private fun hardwareLocked(): Boolean = isQemuRunning() || _state.value.qemu is QemuUi.Starting
+
+    /**
+     * 系统渲染后端：true = Adreno（实验），false = OSMesa。
+     *
+     * 只有「APK 自带运行时」且「本机 GPU 是 Adreno 8xx」才放行。8xx 里非 830 的机型在界面上
+     * 会先弹提示（理论上 8XX 通用，但只在 830 实测过），确认后才走到这里。
+     */
+    fun setExperimentalGpu(value: Boolean) {
+        if (hardwareLocked() || qemuJob?.isActive == true) return
+        if (value) {
+            val gpu = _state.value.gpu
+            if (!gpuAvailable) {
+                toast("当前安装包不含 Adreno 运行时", ToastMessage.Kind.Error)
+                return
+            }
+            if (!gpu.isAdreno8xx) {
+                toast("Adreno 后端需要高通 Adreno 8xx（识别到 ${gpu.summary}）", ToastMessage.Kind.Error)
+                return
+            }
+        }
+        settingsRepo.setExperimentalGpu(value)
+        _state.update { it.copy(settings = it.settings.copy(experimentalGpu = value)) }
+    }
+
+    /** 已经自动回退过一次就不再退，避免「Adreno 失败→OSMesa 也失败→再退」来回打转。 */
+    private var gpuFallbackUsed = false
+
+    /**
+     * Adreno 前置条件不满足时的自动回退。
+     *
+     * 这些条件（运行时包缺文件、独立根镜像的材料缺失/损坏）都是静态的：重试只会得到同样的
+     * 结果，所以失败卡上给「重试」是死循环。此刻 QEMU 还没启动，退回 OSMesa 不会破坏任何
+     * 正在运行的虚拟机；代价只是这一轮用软件渲染，而用户至少能进去。
+     *
+     * 回退是**明示**的：写日志 + toast 说清原因和去哪里改回来，绝不静默改后端。
+     * 返回 true 表示已回退、调用方应继续用 OSMesa 往下走。
+     */
+    private fun fallBackToOsmesa(reason: String): Boolean {
+        if (gpuFallbackUsed) return false
+        gpuFallbackUsed = true
+        AppLog.w(TAG, "Adreno 后端不可用，自动回退 OSMesa：$reason")
+        settingsRepo.setExperimentalGpu(false)
+        _state.update { it.copy(settings = it.settings.copy(experimentalGpu = false)) }
+        toast("Adreno 后端不可用，已自动改用 OSMesa 启动（原因：$reason）。修好后可在首页切回 Adreno。", ToastMessage.Kind.Error)
+        return true
+    }
+
+    fun setDataDisk(mode: String, gib: Int): Boolean {
+        if (hardwareLocked()) return false
+        // 0.31.0 的 UI 多出了「可写实验盘」一档，但白名单没跟着加：点它只会收到一条
+        // 「请选择 1–128 GiB」的错提示，然后什么都不发生。模式与容量分开报错，避免误导。
+        if (mode !in setOf("DISABLED", "PRIVATE_RW", "PRIVATE_QCOW2", "LEGACY_PUBLIC_READ_ONLY")) {
+            toast("不支持的数据盘模式", ToastMessage.Kind.Error)
+            return false
+        }
+        if (gib !in 1..128) {
+            toast("请选择 1–128 GiB 的整数容量", ToastMessage.Kind.Error)
+            return false
+        }
+        settingsRepo.setDataDisk(mode, gib)
+        _state.update { it.copy(settings = it.settings.copy(dataDiskMode = mode, dataDiskGiB = gib)) }
+        return true
+    }
+
     fun setThemeMode(mode: ThemeMode) {
         settingsRepo.setTheme(mode)
         _state.update { it.copy(settings = it.settings.copy(themeMode = mode)) }
     }
 
+    private fun guestCpuSettingsEditable(): Boolean {
+        val s = _state.value.settings
+        return QemuTopology.backendCpu(s.experimentalGpu, s.smp, s.mttcg).guestSettingsEditable
+    }
+
     fun setSmp(value: Int) {
-        if (isQemuRunning()) return
-        settingsRepo.setSmp(value)
-        _state.update { it.copy(settings = it.settings.copy(smp = value)) }
+        if (hardwareLocked() || qemuJob?.isActive == true || !guestCpuSettingsEditable()) return
+        val cores = QemuTopology.normalize(value)
+        settingsRepo.setSmp(cores)
+        _state.update { it.copy(settings = it.settings.copy(smp = cores)) }
     }
 
     /**
@@ -215,7 +361,7 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
      * 不进 payload / ram.img、不改 Guest vCPU 数，所以调节零重建成本。
      */
     fun setHostCores(value: Int) {
-        if (isQemuRunning()) return
+        if (hardwareLocked() || qemuJob?.isActive == true) return
         val n = value.coerceIn(Constants.HOST_CORES_MIN, Constants.HOST_CORES_MAX)
         settingsRepo.setHostCores(n)
         _state.update { it.copy(settings = it.settings.copy(hostCores = n)) }
@@ -223,13 +369,14 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
 
     /** 多线程 TCG 开关：关掉回到 0.23.0 的单线程基线，供排障对比。运行中不可改。 */
     fun setMttcg(value: Boolean) {
-        if (isQemuRunning()) return
+        if (hardwareLocked() || qemuJob?.isActive == true || !guestCpuSettingsEditable()) return
         settingsRepo.setMttcg(value)
         _state.update { it.copy(settings = it.settings.copy(mttcg = value)) }
     }
 
     /** 卡住自动降核保护开关。 */
     fun setAutoFallback(value: Boolean) {
+        if (!guestCpuSettingsEditable()) return
         settingsRepo.setAutoFallback(value)
         _state.update { it.copy(settings = it.settings.copy(autoFallback = value)) }
     }
@@ -245,6 +392,10 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
      * 黑屏的根因是 fbscale（见 BootPhase 的 display 结论），不是核数 —— 这个按钮只处理「卡住」。
      */
     fun restartWithOneCore() {
+        if (_state.value.settings.experimentalGpu) {
+            toast("Adreno 测试固定双核；需要排障时请手动切回 OSMesa", ToastMessage.Kind.Info)
+            return
+        }
         if (qemuJob?.isActive == true) {
             toast("正在启动中，等这一轮结束再试", ToastMessage.Kind.Info)
             return
@@ -282,7 +433,7 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
      */
     private fun maybeAutoFallback(stalledForMs: Long) {
         if (autoFallbackUsed) return
-        if (!_state.value.settings.autoFallback) return
+        if (!_state.value.settings.autoFallback || _state.value.settings.experimentalGpu) return
         if (stalledForMs < Constants.STALL_FALLBACK_MS) return
         if (bootTimeline.reached(BootTimeline.Stage.DESKTOP)) return
         if (qemuJob?.isActive == true || !isQemuRunning()) return
@@ -299,7 +450,9 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
     }
 
     fun setNetEnabled(value: Boolean) {
-        if (isQemuRunning()) return
+        // The switch is disabled during 启动中 as well; keep the VM gate in sync so an MCP or
+        // stale UI call cannot change the network driver of a boot in progress.
+        if (hardwareLocked()) return
         settingsRepo.setNet(value)
         _state.update { it.copy(settings = it.settings.copy(netEnabled = value)) }
     }
@@ -657,17 +810,30 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
             }
             return
         }
-        buildJob = viewModelScope.launch(Dispatchers.IO) {
-            val startedAt = System.currentTimeMillis()
+        val startedAt = System.currentTimeMillis()
+        val lease = reserveResourceOperation(
+            ResourceOperationLease.Operation.Compile,
+            extraBusy = { !portsClearForResourceWrite() },
+            onReserved = {
             _state.update {
                 it.copy(build = BuildUi.Running(
                     "准备", "部署脚本与工具链", BuildUi.Running.NO_PROGRESS, "prepare",
                     startedAtMs = startedAt, phaseStartedAtMs = startedAt,
                 ))
             }
-            val published = StoragePaths.imagesDir(ctx)
-            val result = runCatching {
+        })
+        if (lease == null) {
+            toast("QEMU、编译或资源维护正在进行，暂不能开始编译", ToastMessage.Kind.Info)
+            return
+        }
+        buildJob = viewModelScope.launch(Dispatchers.IO) {
+            try {
+                val published = StoragePaths.imagesDir(ctx)
+                val result = runCatching {
                 kotlinx.coroutines.withContext(Dispatchers.IO) {
+                    if (!portsClearForResourceWrite()) throw IllegalStateException(
+                        "QEMU 控制端口仍占用或无法确认已释放；未部署资源、未覆盖 UEFI Vars。"
+                    )
                     val dep = deployer.deploy()
                     if (!dep.ok) throw IllegalStateException("资源未就绪：缺 ${dep.missing.joinToString()}")
                     imageBuilder.build(ipsw, published, object : ImageBuilder.Progress {
@@ -747,6 +913,21 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
                     _state.update { it.copy(build = BuildUi.Failed(first, TailText.of(msg, FAIL_CHARS))) }
                 }
             }
+            } finally {
+                finishResourceOperation(lease) {
+                    if (_state.value.build is BuildUi.Running) {
+                        _state.update { it.copy(build = BuildUi.Cancelled(imageBuilder.stage)) }
+                    }
+                }
+            }
+        }.also { job ->
+            job.invokeOnCompletion {
+                finishResourceOperation(lease) {
+                    if (_state.value.build is BuildUi.Running) {
+                        _state.update { it.copy(build = BuildUi.Cancelled(imageBuilder.stage)) }
+                    }
+                }
+            }
         }
     }
 
@@ -763,47 +944,73 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
 
     fun startQemu() {
         if (qemuJob?.isActive == true || isQemuRunning()) return
-        val cores = _state.value.settings.smp
-        val hostCores = _state.value.settings.hostCores
-        val mttcg = _state.value.settings.mttcg
-        autoFallbackUsed = false
-        bootTimeline.start(cores, mttcg, hostCores)
-        AppLog.i(TAG, "开始启动：${QemuTopology.describe(cores, hostCores, mttcg)}")
-        // 0.26.0：每次启动开一份新的结构化诊断日志，上一份备份为 .prev.log 供对比。
-        diagBootAt = System.currentTimeMillis()
-        diagLastEmitAt = diagBootAt
-        diagSerialTotal = 0L
-        diagSerialDelta = 0
-        diagSerialLast = null
-        diagSerialLastAt = diagBootAt
-        diagStageSince = diagBootAt
-        diagPrev = null
-        // 0.26.1 直读探针状态随每轮启动重置。
-        guestDisplay = null
-        fbProbeDone = false
-        fbProbeNote = null
-        fbProbeNoted = false
-        // 0.26.0 错误细化目录：每次启动新建 Session，清掉上一轮档案与快照文件。
-        errorSession = BootErrorCatalog.Session()
-        errorRenderedIds.clear()
-        runCatching {
-            File(deployer.runDirectory(), "error-catalog.log")
-                .writeText("# 启动错误细化档案（错误出现时实时刷新）· version=0.26.1\n")
+        val lease = reserveResourceOperation(
+            ResourceOperationLease.Operation.Start,
+            extraBusy = { !portsClearForResourceWrite() },
+            onReserved = {
+            val now = System.currentTimeMillis()
+            diagBootAt = now
+            _state.update { it.copy(qemu = QemuUi.Starting("检查控制端口", sinceEpochMs = now)) }
+        })
+        if (lease == null) {
+            toast("QEMU、编译或资源维护正在进行；请先停止当前操作", ToastMessage.Kind.Info)
+            return
         }
-        BootDiagnosticLogger.begin(
-            deployer.runDirectory(),
-            "${QemuTopology.describe(cores, hostCores, mttcg)} · version=0.26.1",
-        )
-        if (cores > Constants.SMP_STABLE_MAX) {
-            // 7/8 核只是软提示：MTTCG 让它们能并行，但 guest 自身的调度压力确实会上升。
-            toast(
-                "$cores 核超出推荐稳定档（${Constants.SMP_STABLE_MAX} 核），若界面层卡住会自动降核",
-                ToastMessage.Kind.Info,
-            )
-        }
+        val settings = _state.value.settings
+        val adreno = settings.experimentalGpu
+        val cpu = QemuTopology.backendCpu(adreno, settings.smp, settings.mttcg)
+        val cores = cpu.guestCores
+        val hostCores = settings.hostCores
+        val mttcg = cpu.mttcg
         qemuJob = viewModelScope.launch(Dispatchers.IO) {
-            _state.update { it.copy(qemu = QemuUi.Starting("检查运行资源")) }
-            val dep = runCatching { deployer.deploy() }.getOrElse {
+            try {
+                autoFallbackUsed = false
+                bootTimeline.start(cores, mttcg, hostCores)
+                AppLog.i(TAG, "开始启动：${QemuTopology.describe(cores, hostCores, mttcg)}")
+                diagLastEmitAt = diagBootAt
+                diagSerialTotal = 0L
+                diagSerialDelta = 0
+                diagSerialLast = null
+                diagSerialLastAt = diagBootAt
+                diagStageSince = diagBootAt
+                diagPrev = null
+                guestDisplay = null
+                fbProbeDone = false
+                fbProbeNote = null
+                fbProbeNoted = false
+                errorSession = BootErrorCatalog.Session()
+                errorRenderedIds.clear()
+                runCatching {
+                    File(deployer.runDirectory(), "error-catalog.log")
+                        .writeText("# 启动错误细化档案（错误出现时实时刷新）· version=0.26.1\n")
+                }
+                BootDiagnosticLogger.begin(
+                    deployer.runDirectory(),
+                    "${QemuTopology.describe(cores, hostCores, mttcg)} · version=0.26.1",
+                )
+                if (cores > Constants.SMP_STABLE_MAX) {
+                    toast(
+                        "$cores 核超出推荐稳定档（${Constants.SMP_STABLE_MAX} 核），若界面层卡住会自动降核",
+                        ToastMessage.Kind.Info,
+                    )
+                }
+                _state.update { it.copy(qemu = QemuUi.Starting("检查控制端口", sinceEpochMs = diagBootAt)) }
+                val preexistingPorts = runCatching { QemuPreflight.busyPorts() }.getOrElse { listOf(4444, 4445) }
+                if (preexistingPorts.isNotEmpty()) {
+                    _state.update {
+                        it.copy(qemu = QemuUi.Failed(
+                            QemuFailure(
+                                QemuFailureKind.PortInUse,
+                                "控制端口被占用",
+                                "端口 ${preexistingPorts.joinToString(" / ")} 已被占用或无法确认；为避免覆盖仍在使用的 UEFI Vars，本次未部署资源也未终止任何进程。",
+                                "确认旧 QEMU 已停止并手动释放端口后重试；不要在端口仍占用时重置 UEFI Vars。",
+                            )
+                        ))
+                    }
+                    return@launch
+                }
+                _state.update { it.copy(qemu = QemuUi.Starting("检查运行资源", sinceEpochMs = diagBootAt)) }
+                val dep = runCatching { deployer.deploy() }.getOrElse {
                 failQemu("资源部署失败", it.message ?: "未知错误", "点「重新部署资源」后重试")
                 return@launch
             }
@@ -850,45 +1057,105 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
                 return@launch
             }
 
-            val busy = runCatching { QemuPreflight.busyPorts() }.getOrDefault(emptyList())
+            val busy = runCatching { QemuPreflight.busyPorts() }.getOrElse { listOf(4444, 4445) }
             if (busy.isNotEmpty()) {
-                _state.update { it.copy(qemu = QemuUi.Starting("清理残留的 QEMU 进程")) }
-                control.quit()
-                delay(700)
-                val stillBusy = runCatching { QemuPreflight.busyPorts() }.getOrDefault(emptyList())
-                if (stillBusy.isNotEmpty()) {
-                    _state.update {
-                        it.copy(
-                            qemu = QemuUi.Failed(
-                                QemuFailure(
-                                    QemuFailureKind.PortInUse,
-                                    "控制端口被占用",
-                                    "端口 ${stillBusy.joinToString(" / ")} 仍被占用，通常是上一次 QEMU 崩溃后没有退出。",
-                                    "点「强制清理」结束残留进程，再重新启动。",
-                                )
-                            )
+                _state.update {
+                    it.copy(qemu = QemuUi.Failed(
+                        QemuFailure(
+                            QemuFailureKind.PortInUse,
+                            "控制端口被占用",
+                            "端口 ${busy.joinToString(" / ")} 已被占用或无法确认已释放；为避免影响其它进程，本次不发送 quit/kill。",
+                            "确认旧 QEMU 已停止并手动释放端口后重试。",
                         )
-                    }
-                    return@launch
+                    ))
                 }
+                return@launch
             }
 
-            val smp = _state.value.settings.smp
-            val hostCores = _state.value.settings.hostCores
-            val net = _state.value.settings.netEnabled
-            val bootArgs = _state.value.settings.bootArgs
-            val extraFlags = _state.value.settings.qemuFlags
+            /*
+             * Adreno 的两个前置条件（运行时包、独立根镜像）都是**静态**的：只要不换 APK、不重编
+             * 镜像、不清数据，重试一百次也是同一个结果。0.31.4 真机两次卡在这里，而失败卡的主按钮
+             * 是「重试」——那是个死循环。所以这里改成：能自动回退的就自动回退（此刻 QEMU 还没起来，
+             * 退到 OSMesa 完全安全），并且**明说**发生了什么、去哪里改回来；只有真正需要人做的
+             * 事（重编镜像）才留给用户。
+             */
+            var backendIsAdreno = adreno
+            var gpu = if (backendIsAdreno) {
+                _state.update { it.copy(qemu = QemuUi.Starting("检查 Adreno 与 Turnip", sinceEpochMs = diagBootAt)) }
+                try {
+                    GpuRuntime.prepare(ctx, deployer.runDirectory())
+                } catch (e: Exception) {
+                    if (e is CancellationException) throw e
+                    if (fallBackToOsmesa(e.message ?: e.javaClass.simpleName)) {
+                        backendIsAdreno = false
+                        null
+                    } else {
+                        failQemu("Adreno 运行时不可用", e.message ?: e.javaClass.simpleName, GPU_RECOVERY)
+                        return@launch
+                    }
+                }
+            } else null
+            var effectiveRoot = root
+            if (backendIsAdreno) {
+                _state.update { it.copy(qemu = QemuUi.Starting("准备独立 Adreno 根镜像", sinceEpochMs = diagBootAt)) }
+                try {
+                    effectiveRoot = imageBuilder.prepareGpuRoot(root)
+                } catch (e: Exception) {
+                    if (e is CancellationException) throw e
+                    // Prepared 只是解包好的运行时目录，没有要关闭的句柄；退到 OSMesa 后它留着
+                    // 不影响本次启动，下次切回 Adreno 还能直接用。
+                    gpu = null
+                    if (fallBackToOsmesa(e.message ?: e.javaClass.simpleName)) {
+                        backendIsAdreno = false
+                        effectiveRoot = root
+                    } else {
+                        failQemu("Adreno 根镜像不可用", e.message ?: e.javaClass.simpleName, GPU_RECOVERY)
+                        return@launch
+                    }
+                }
+            }
+            val smp = cores
+            val hardware = try {
+                withContext(Dispatchers.IO) {
+                    // 驱动只有内置这一套（导入驱动已移除）：网络按开关与 Adreno 档位选，
+                    // 输入与显示固定为 virtio 触摸键盘和 ramfb。
+                    val network = if (backendIsAdreno) "virtio-network-user"
+                        else if (settings.netEnabled) "virtio-network-user" else "network-none"
+                    val drivers = VmDrivers.builtin.select(
+                        network, "virtio-touch-keyboard", "ramfb-2d",
+                    )
+                    // 存储模式从 SharedPreferences 读回来可能是旧版本写的值；认不出来就当作不挂载，
+                    // 不要因为一个字符串让整次启动失败。
+                    val mode = runCatching { IosDataStorage.Mode.valueOf(settings.dataDiskMode) }
+                        .getOrDefault(IosDataStorage.Mode.DISABLED)
+                    // 公共盘位置始终传：可写盘要用它的父目录（Download/hackios/disks），
+                    // 只读的原有公共盘要用它的完整路径。
+                    val disk = IosDataStorage.prepare(
+                        ctx.filesDir, StoragePaths.iosDataDiskLocation(ctx), mode, settings.dataDiskGiB,
+                    )
+                    Triple(drivers, disk, !backendIsAdreno && network != "network-none")
+                }
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                failQemu("驱动或存储不可用", e.message ?: e.javaClass.simpleName,
+                    "在首页检查数据盘模式、容量与存储权限；原有数据盘不会被自动覆盖或重建。")
+                return@launch
+            }
+            val (drivers, dataDisk, net) = hardware
+            val bootArgs = QemuFlags.launchBootArgs(settings.bootArgs, backendIsAdreno, dataDisk?.bootArg)
+            val extraFlags = settings.qemuFlags
             // 0.24.0：prepare 内部按 .ram-stamp / .payload-stamp 分别判断，改核数只重打包
             // payload，不重拷 2.5 GB 的 ram.img。外层这层判断只用来决定要不要显示「准备…」。
             if (runCatching {
-                    QemuPreflight.needsPrepare(deployer.runDirectory(), sys, root, smp, rev, bootArgs)
+                    QemuPreflight.needsPrepare(deployer.runDirectory(), sys, effectiveRoot, smp, rev, bootArgs)
                 }.getOrDefault(true)
             ) {
-                _state.update { it.copy(qemu = QemuUi.Starting("准备引导负载（payload / ram.img）")) }
+                _state.update { it.copy(qemu = QemuUi.Starting("准备引导负载（payload / ram.img）", sinceEpochMs = diagBootAt)) }
                 if (!runner.willRebuildRam(sys, rev)) bootTimeline.notePayloadReused()
                 val prepared = runCatching {
                     kotlinx.coroutines.withContext(Dispatchers.IO) {
-                        runner.prepare(sys, root, smp = smp, extraBootArgs = bootArgs, rev = rev)
+                        runner.prepare(sys, effectiveRoot, smp = smp, extraBootArgs = bootArgs, rev = rev)
                     }
                 }
                 if (prepared.isFailure) {
@@ -914,13 +1181,24 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
             if (previousSerial.contains("UEFI Interactive Shell") ||
                 previousSerial.contains("Shell>") || previousSerial.contains("FS0:")
             ) {
+                if (!portsClearForResourceWrite()) {
+                    _state.update { it.copy(qemu = QemuUi.Failed(
+                        QemuFailure(
+                            QemuFailureKind.PortInUse,
+                            "无法安全重置 UEFI Vars",
+                            "QEMU 控制端口仍占用或无法确认已释放，因此保留当前 NVRAM。",
+                            "确认所有 QEMU 实例已停止、4444/4445 已释放后再启动。",
+                        )
+                    )) }
+                    return@launch
+                }
                 if (deployer.resetEfiVars()) {
                     runCatching { runner.serialLog().delete() }
                     AppLog.w(TAG, "上次停在 EFI Shell：已重置 UEFI NVRAM，本次重新从 BOOTAA64.EFI 启动")
                 }
             }
 
-            _state.update { it.copy(qemu = QemuUi.Starting("启动 QEMU（MTTCG 软件模拟）")) }
+            _state.update { it.copy(qemu = QemuUi.Starting(if (backendIsAdreno) "启动 QEMU + Adreno" else "启动 QEMU（TCG 软件模拟）", sinceEpochMs = diagBootAt)) }
             val started = runCatching {
                 kotlinx.coroutines.withContext(Dispatchers.IO) {
                     runner.start(
@@ -930,11 +1208,19 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
                         extraFlags = extraFlags,
                         mttcg = mttcg,
                         hostCores = hostCores,
+                        drivers = drivers,
+                        dataDisk = dataDisk,
+                        gpu = gpu,
                     )
                 }
             }
             if (started.isFailure) {
                 val t = started.exceptionOrNull()!!
+                if (t is CancellationException) throw t
+                if (backendIsAdreno) {
+                    failQemu("Adreno 启动失败", t.message ?: t.javaClass.simpleName, GPU_RECOVERY)
+                    return@launch
+                }
                 _state.update {
                     it.copy(
                         qemu = QemuUi.Failed(
@@ -963,7 +1249,7 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
                 val firstLog = runCatching { runner.qemuLog().readText().trim() }.getOrDefault("")
                 val firstSummary = runner.lastStartSummary
                 var retried = false
-                if ((firstExit == 1 || firstExit == 2) && !runner.serialLog().isFile) {
+                if (!backendIsAdreno && (firstExit == 1 || firstExit == 2) && !runner.serialLog().isFile) {
                     runCatching {
                         File(deployer.runDirectory(), "qemu-first-attempt.log").writeText(
                             "exit=$firstExit\n${firstLog.ifEmpty { "(qemu.log 为空)" }}\n" +
@@ -986,13 +1272,15 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
                                 mttcg = false,
                                 hostCores = hostCores,
                                 tbMiB = 512,
+                                drivers = drivers,
+                                dataDisk = dataDisk,
                             )
                         }
                     }.isSuccess
                     if (retried) delay(BOOT_PROBE_MS)
                 }
                 if (!runner.isRunning()) {
-                    val failure = QemuFailureClassifier.classify(
+                    val failure = runner.gpuFailure?.let(::gpuWorkerFailure) ?: QemuFailureClassifier.classify(
                         exitCode = runner.exitCode(),
                         qemuLog = readFileTail(runner.qemuLog(), 4000),
                         serialLogExists = runner.serialLog().isFile,
@@ -1009,6 +1297,9 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
             qemuTail.reset()
             phaseText.setLength(0)
             control.connect()
+            // A6：worker 的帧环若已就绪就接管取帧；默认关闭时这里拿到 null，
+            // useFrameRing(null) 不改变任何取帧行为，只是把状态复位到「只用 screendump」。
+            capture.useFrameRing(runner.gpuFrameRing()?.let(FrameRing::open))
             capture.start()
             bootTimeline.mark(BootTimeline.Stage.QEMU_SPAWN)
             persistTimeline()
@@ -1028,12 +1319,34 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
                     "亲和性${if (runner.lastAffinityApplied) "已启用" else "降级"}），正在引导 iOS",
                 ToastMessage.Kind.Success,
             )
+            } catch (cancelled: CancellationException) {
+                if (_state.value.qemu is QemuUi.Starting) _state.update { it.copy(qemu = QemuUi.Stopped) }
+                throw cancelled
+            } catch (t: Exception) {
+                failQemu("启动过程异常", t.message ?: t.javaClass.simpleName, "检查日志；若控制端口仍被占用，先确认旧 QEMU 已停止。")
+            } finally {
+                finishResourceOperation(lease) {
+                    if (_state.value.qemu is QemuUi.Starting) {
+                        _state.update { it.copy(qemu = QemuUi.Stopped) }
+                    }
+                }
+            }
+        }.also { job ->
+            job.invokeOnCompletion {
+                finishResourceOperation(lease) {
+                    if (_state.value.qemu is QemuUi.Starting) {
+                        _state.update { it.copy(qemu = QemuUi.Stopped) }
+                    }
+                }
+            }
         }
     }
 
     fun stopQemu() {
         val wasRunning = isQemuRunning()
         capture.stop()
+        // 帧环文件随 GPU 会话一起删掉；先摘掉引用，避免下次 start 前读到已删除的映射。
+        capture.useFrameRing(null)
         qemuJob?.cancel()
         qemuJob = null
         viewModelScope.launch(Dispatchers.IO) {
@@ -1107,15 +1420,15 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
     }
 
     /** User chose to boot anyway even though the images are older than this APK. */
-    fun ignoreStaleImages() {
-        _state.update { it.copy(qemu = QemuUi.Stopped) }
-        toast("仍要启动旧镜像：可到「资源」页重编后再试", ToastMessage.Kind.Info)
-    }
 
     fun retryQemu() {
         _state.update { it.copy(qemu = QemuUi.Stopped) }
         startQemu()
     }
+
+    private fun gpuWorkerFailure(detail: String) = QemuFailure(
+        QemuFailureKind.Unknown, "Adreno 渲染进程已退出", detail, GPU_RECOVERY,
+    )
 
     private fun failQemu(title: String, detail: String, hint: String?) {
         _state.update {
@@ -1314,7 +1627,7 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
                 return@withContext "截帧失败：monitor 不可达（QEMU 可能没有在运行，或刚启动还没协商出分辨率）。" +
                     "上一次错误：" + (snap.lastError ?: "无")
             }
-            "屏幕 ${snap.resolution}，平均亮度 ${snap.mean}/765，黑屏连续 ${snap.blackStreak} 帧，" +
+            "屏幕 ${snap.resolution}，平均亮度 ${snap.mean}/255，黑屏连续 ${snap.blackStreak} 帧，" +
                 "取帧 ${snap.frames} 次（${"%.1f".format(snap.fps)} fps）。" +
                 if (snap.mean <= 2) "全黑：访客没有往 framebuffer 画任何东西——问题在访客侧，不在取帧。" else "访客正在渲染。"
         }
@@ -1329,6 +1642,9 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
                     if (isQemuRunning()) return@withContext "QEMU 已经在运行，无需重复启动。"
                     if (qemuJob?.isActive == true) return@withContext "正在启动中，请等这一轮结束。"
                     startQemu()
+                    if (_state.value.qemu !is QemuUi.Starting && _state.value.qemu !is QemuUi.Running) {
+                        throw ToolError("启动未受理：QEMU、编译或资源维护正在进行，或端口被占用；请查看当前状态。")
+                    }
                     "已发出启动：部署资源 → 检查镜像 → 构建 payload → 启动 QEMU。" +
                         "TCG 下到 SpringBoard 需要 1–3 分钟，用 device_status / read_log(serial) 看进展。"
                 }
@@ -1364,15 +1680,14 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
                     "已发送按键 ${args.optString("name")}。"
                 }
 
-                "deploy_assets" -> {
-                    val dep = runCatching { deployer.deploy() }
-                        .getOrElse { throw ToolError("资源部署失败：${it.message}") }
-                    if (!dep.ok) throw ToolError("资源部署未完成，缺少：${dep.missing.joinToString()}")
-                    "已从 APK 重新部署 QEMU 二进制、工具链与构建脚本到 ${deployer.runDirectory().absolutePath}。"
-                }
+                "deploy_assets" -> deployAssetsFromMcp()
 
                 "compile_images" -> {
                     compileImages()
+                    if (_state.value.build !is BuildUi.Running) throw ToolError(
+                        if (_state.value.permissionPending) "编译需要先授予存储访问权限。"
+                        else "编译未受理：QEMU、编译或资源维护正在进行，或控制端口仍被占用；请查看当前状态。"
+                    )
                     "已触发镜像编译（20–40 分钟，可中断续跑）。用 device_status 与 read_log(build) 跟踪。"
                 }
 
@@ -1404,7 +1719,9 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
                 }
 
                 "run_diagnostics" -> {
-                    runDiagnostics()
+                    if (!startDiagnostics()) throw ToolError(
+                        "QEMU、编译或资源维护正在进行，或控制端口仍被占用；暂不能运行自检。"
+                    )
                     "已触发工具链自检（bash / python3 / 7zz / unzbm），结果见 device_status 与日志页。"
                 }
 
@@ -1434,14 +1751,15 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         val cfg = _state.value.settings.mcp
         return when (key) {
             "smp" -> {
-                if (isQemuRunning()) throw ToolError("QEMU 运行中不能改核数：先 stop_qemu。")
+                if (hardwareLocked() || qemuJob?.isActive == true) throw ToolError("虚拟机启动或运行中不能改核数：请先停止。")
+                if (!guestCpuSettingsEditable()) throw ToolError("Adreno 固定双核；请切回 OSMesa 后再改。")
                 val n = value.toIntOrNull() ?: throw ToolError("smp 需要整数，收到 $value")
                 setSmp(n)
                 "Guest vCPU(smp) 已设为 ${_state.value.settings.smp}（${QemuTopology.describe(_state.value.settings.smp, _state.value.settings.hostCores, _state.value.settings.mttcg)}），下一次启动生效。改 vCPU 数只重建 payload，不重拷 ram.img。"
             }
 
             "host_cores" -> {
-                if (isQemuRunning()) throw ToolError("QEMU 运行中不能改宿主算力池：先 stop_qemu。")
+                if (hardwareLocked() || qemuJob?.isActive == true) throw ToolError("虚拟机启动或运行中不能改宿主算力池：请先停止。")
                 val n = value.toIntOrNull() ?: throw ToolError("host_cores 需要整数，收到 $value")
                 if (n !in Constants.HOST_CORES_MIN..Constants.HOST_CORES_MAX) {
                     throw ToolError("host_cores 必须在 ${Constants.HOST_CORES_MIN}..${Constants.HOST_CORES_MAX}，收到 $n")
@@ -1454,13 +1772,15 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
             }
 
             "mttcg" -> {
-                if (isQemuRunning()) throw ToolError("QEMU 运行中不能改 TCG 模式：先 stop_qemu。")
+                if (hardwareLocked() || qemuJob?.isActive == true) throw ToolError("虚拟机启动或运行中不能改 TCG 模式：请先停止。")
+                if (!guestCpuSettingsEditable()) throw ToolError("Adreno 固定使用多线程 TCG；请切回 OSMesa 后再改。")
                 setMttcg(value.equals("true", ignoreCase = true))
                 "mttcg 已设为 ${_state.value.settings.mttcg}；下一次启动使用 " +
                     QemuTopology.describe(_state.value.settings.smp, _state.value.settings.hostCores, _state.value.settings.mttcg) + "。"
             }
 
             "auto_fallback" -> {
+                if (!guestCpuSettingsEditable()) throw ToolError("Adreno 不自动降核；请切回 OSMesa 后再改。")
                 setAutoFallback(value.equals("true", ignoreCase = true))
                 "auto_fallback 已设为 ${_state.value.settings.autoFallback}（卡住 ${Constants.STALL_FALLBACK_MS / 1000}s 自动降核一次）。"
             }
@@ -1640,6 +1960,8 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
                 add(LogExporter.Section("启动诊断（上一次启动）", BootDiagnosticLogger.prevFile()))
                 add(LogExporter.Section("串口 serial.log", File(runDir, "serial.log")))
                 add(LogExporter.Section("QEMU 输出 qemu.log", File(runDir, "qemu.log")))
+                add(LogExporter.Section("Adreno 自检", File(runDir, "gpu-self-test.log")))
+                add(LogExporter.Section("Adreno 渲染", File(runDir, "gpu-worker.log")))
                 // 0.24.0：分段计时随日志一起走，「3 分钟到桌面」这类结论要靠它复核。
                 add(LogExporter.Section("启动分段计时", File(runDir, BootTimeline.FILE_NAME)))
                 add(LogExporter.Section("启动命令行", File(runDir, "qemu-cmdline.txt")))
@@ -1718,43 +2040,107 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         )
     }
 
+    private fun deployAssetsFromMcp(): String {
+        val lease = reserveResourceOperation(
+            ResourceOperationLease.Operation.DeployAssets,
+            extraBusy = { !portsClearForResourceWrite() },
+            onReserved = {
+                _state.update {
+                    it.copy(diagnostics = DiagnosticsUi(running = true, lines = listOf("正在部署并检查 APK 资源…")))
+                }
+            },
+        ) ?: throw ToolError("QEMU、编译或资源维护正在进行，或控制端口仍被占用；停止并确认端口释放后再部署。")
+        return try {
+            if (!portsClearForResourceWrite()) throw ToolError(
+                "QEMU 控制端口仍占用或无法确认已释放；未部署资源。"
+            )
+            val dep = runCatching { deployer.deploy() }
+                .getOrElse { throw ToolError("资源部署失败：${it.message}") }
+            if (!dep.ok) throw ToolError("资源部署未完成，缺少或拒绝覆盖：${dep.missing.joinToString()}")
+            "已从 APK 检查/部署 QEMU 二进制、工具链与构建脚本到 ${deployer.runDirectory().absolutePath}。"
+        } finally {
+            finishResourceOperation(lease) {
+                _state.update { it.copy(diagnostics = it.diagnostics.copy(running = false)) }
+            }
+        }
+    }
+
     // ---- intents: diagnostics ------------------------------------------------------------------
 
     fun runDiagnostics() {
-        if (_state.value.diagnostics.running) return
-        viewModelScope.launch(Dispatchers.IO) {
-            _state.update { it.copy(diagnostics = DiagnosticsUi(running = true, lines = listOf("正在自检…"))) }
-            val lines = mutableListOf<String>()
-            val checks = runCatching {
-                kotlinx.coroutines.withContext(Dispatchers.IO) {
-                    deployer.deploy()
-                    imageBuilder.verify { line -> lines += line }
-                }
-            }
-            checks.onSuccess { list ->
-                val failed = list.count { !it.ok }
-                _state.update {
-                    it.copy(
-                        diagnostics = DiagnosticsUi(
-                            running = false,
-                            lines = lines.takeLast(300),
-                            summary = if (failed == 0) "全部 ${list.size} 项通过"
-                            else "$failed / ${list.size} 项需要处理",
+        startDiagnostics()
+    }
+
+    private fun startDiagnostics(): Boolean {
+        val lease = reserveResourceOperation(
+            ResourceOperationLease.Operation.Diagnostics,
+            extraBusy = { !portsClearForResourceWrite() },
+            onReserved = {
+                _state.update { it.copy(diagnostics = DiagnosticsUi(running = true, lines = listOf("正在自检…"))) }
+            },
+        ) ?: run {
+            toast("QEMU、编译或资源维护正在进行，或控制端口仍被占用；暂不能自检", ToastMessage.Kind.Info)
+            return false
+        }
+        val job = viewModelScope.launch(Dispatchers.IO) {
+            try {
+                val lines = mutableListOf<String>()
+                val checks = runCatching {
+                    withContext(Dispatchers.IO) {
+                        if (!portsClearForResourceWrite()) throw IllegalStateException(
+                            "QEMU 控制端口仍占用或无法确认已释放；未部署资源。"
                         )
-                    )
-                }
-            }.onFailure { t ->
-                _state.update {
-                    it.copy(
-                        diagnostics = DiagnosticsUi(
-                            running = false,
-                            lines = lines + "自检异常：${t.message ?: t.javaClass.simpleName}",
-                            summary = "自检未能完成",
+                        val deployed = deployer.deploy()
+                        if (!deployed.ok) throw IllegalStateException(
+                            "资源未就绪：缺少或拒绝覆盖 ${deployed.missing.joinToString()}"
                         )
-                    )
+                        imageBuilder.verify { line -> lines += line }
+                    }
+                }
+                checks.onSuccess { list ->
+                    val failed = list.count { !it.ok }
+                    _state.update {
+                        it.copy(
+                            diagnostics = DiagnosticsUi(
+                                running = false,
+                                lines = lines.takeLast(300),
+                                summary = if (failed == 0) "全部 ${list.size} 项通过"
+                                else "$failed / ${list.size} 项需要处理",
+                            )
+                        )
+                    }
+                }.onFailure { t ->
+                    _state.update {
+                        it.copy(
+                            diagnostics = DiagnosticsUi(
+                                running = false,
+                                lines = lines + "自检异常：${t.message ?: t.javaClass.simpleName}",
+                                summary = "自检未能完成",
+                            )
+                        )
+                    }
+                }
+            } finally {
+                finishResourceOperation(lease) {
+                    if (_state.value.diagnostics.running) {
+                        _state.update {
+                            it.copy(diagnostics = it.diagnostics.copy(
+                                running = false,
+                                summary = "自检已取消",
+                            ))
+                        }
+                    }
                 }
             }
         }
+        job.invokeOnCompletion {
+            finishResourceOperation(lease) {
+                if (_state.value.diagnostics.running) {
+                    _state.update { it.copy(diagnostics = it.diagnostics.copy(running = false, summary = "自检已取消")) }
+                }
+            }
+        }
+        return true
     }
 
     fun onPermissionResult(granted: Boolean) {
@@ -1865,7 +2251,7 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
                             exitCode = runner.exitCode(),
                             serialLogExists = runner.serialLog().isFile,
                         )
-                        val failure = QemuFailureClassifier.classify(
+                        val failure = runner.gpuFailure?.let(::gpuWorkerFailure) ?: QemuFailureClassifier.classify(
                             exitCode = runner.exitCode(),
                             qemuLog = readFileTail(runner.qemuLog(), 4000),
                             serialLogExists = runner.serialLog().isFile,
@@ -1905,15 +2291,12 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
     private fun updatePhase() {
         val r = BootPhase.analyze(phaseText.toString())
         val cap = _state.value.capture
-        // 第 7 级只认画面：捕获到的不是黑帧，且至少换过 1 次内容。串口说 "backboardd startup
-        // complete" 的那一刻屏幕依然可能是黑的 —— 那正是用户报「画面连不上」时的真实状态，
-        // 所以文本证据（r.desktopSignal）只进 notes，不参与升级。
-        // 0.25.0 把门槛从 3 次降到 1 次：自适应取帧在启动期只跑 2 FPS，要求换 3 次内容
-        // 会让「已经看到桌面」却永远停在 6/7 —— 真机日志就是一直停在阶段 6。
-        val painted = cap.frames > 0 && cap.mean > 2 && cap.changedFrames >= 1
+        // Stage 7 requires actual content outside the central Logo and bottom log band.
+        // A SpringBoard launch or a changing console panel is not a usable interface.
+        val painted = cap.health == CapturePipeline.Health.Live && cap.sceneHasContent
         val stage = if (r.stage >= 6 && painted && !r.stuck) 7 else r.stage
 
-        // 把文本阶段喂给取帧调度器：引导期 2 FPS，把 CPU 让给 XNU/SpringBoard。
+        // 文本阶段只用于诊断：0.32.0 起引导期和桌面都按同一个 60 FPS 目标取帧，不再降帧。
         capture.setBootStage(r.stage)
 
         // ---- 启动分段计时：把 BootPhase 的文本阶段与真实画面一起喂给时间线 ------------------
@@ -1931,7 +2314,7 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
                 AppLog.i(TAG, "亮起 Logo：${it}ms（预算 ${BootTimeline.LOGO_BUDGET_MS}ms）")
             }
             if (!hadDesktop) bootTimeline.elapsed(BootTimeline.Stage.DESKTOP)?.let {
-                AppLog.i(TAG, "进入桌面：${it}ms（预算 ${BootTimeline.DESKTOP_BUDGET_MS}ms）")
+                AppLog.i(TAG, "锁屏或主界面可见（画面判定）：${it}ms（预算 ${BootTimeline.DESKTOP_BUDGET_MS}ms）")
             }
         }
 
@@ -1955,9 +2338,9 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
             r.net?.let(::add)
             r.noise?.let(::add)
             if (cap.frames > 0) {
-                add("画面 ${cap.frames} 帧 · ${cap.resolution} · 亮度 ${cap.mean}/765 · 单帧 ${cap.captureMs}ms")
+                add("画面 ${cap.frames} 帧 · ${cap.resolution} · 亮度 ${cap.mean}/255 · 单帧 ${cap.captureMs}ms")
                 add("取帧调度：${com.android.gudao.iphoneos.engine.FramePacer.describe(cap.intervalMs)}，" +
-                    "间隔 ${cap.intervalMs}ms（引导期让 CPU 给 guest）")
+                    "间隔 ${cap.intervalMs}ms（实测 ${"%.1f".format(cap.fps)} FPS）")
             }
             bootTimeline.elapsed(BootTimeline.Stage.LOGO)?.let {
                 add("亮 Logo 用时 ${it / 1000}.${(it % 1000) / 100}s · 预算 ${BootTimeline.LOGO_BUDGET_MS / 1000}s")
@@ -1973,7 +2356,7 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
                 )
             }
         }
-        val label = if (stage == 7) "阶段 7/7 · 画面已出现" else r.label
+        val label = if (stage == 7) "阶段 7/7 · 图形界面可见" else r.label
         val next = BootPhaseUi(stage, label, r.stuck, notes)
         val before = (_state.value.qemu as? QemuUi.Running)?.phase?.stage
         _state.update { st ->
@@ -2022,6 +2405,9 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
             meanBrightness = cap.mean,
             resolution = cap.resolution,
             captureMs = cap.captureMs,
+            dumpMs = cap.dumpMs,
+            decodeMs = cap.decodeMs,
+            contentFps = cap.contentFps,
             intervalMs = cap.intervalMs,
             framePace = com.android.gudao.iphoneos.engine.FramePacer.describe(cap.intervalMs),
             unchangedForMs = cap.unchangedForMs,
@@ -2190,10 +2576,9 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
             appendLine("  \"guest_vcpus\": ${s.smp},")
             appendLine("  \"host_cores\": ${s.hostCores},")
             appendLine("  \"tb_size_mib\": ${QemuTopology.tbSize(s.hostCores)},")
-            // 0.29.5：写入**真正生效**的掩码（如 6-7）。它由启动时读到的 Cpus_allowed_list 与
-            // cpufreq 现算，可能和滑块档位的 0-(N-1) 不同；降级时回落到计划掩码便于对照。
-            val appliedMask = runner.lastAffinityMask.ifEmpty { QemuTopology.affinityMask(s.hostCores) }
-            appendLine("  \"affinity_mask\": \"$appliedMask\",")
+            // 这是启动包装器自检的掩码，不代表 vCPU 运行时驻留；未绑核时不要编出 0-(N-1)。
+            val appliedMask = runner.lastAffinityMask.takeIf { runner.lastAffinityApplied && it.isNotEmpty() }
+            appendLine("  \"affinity_mask\": ${appliedMask?.let { "\"$it\"" } ?: "null"},")
             appendLine("  \"affinity_applied\": ${runner.lastAffinityApplied},")
             appendLine("  \"mttcg\": ${s.mttcg},")
             appendLine("  \"frame_interval_ms\": ${cap.intervalMs},")

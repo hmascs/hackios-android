@@ -55,11 +55,11 @@ class BootErrorCatalogTest {
         assertEquals(BootErrorCatalog.Layer.DAEMON, f.rule.layer)
         assertEquals(BootErrorCatalog.Severity.DEGRADED, f.rule.severity)
         assertFalse("lsd 不阻塞桌面", f.rule.blocking)
-        // 根因要讲透「不是 CPU 出错」，而是服务缺失→重试→越权放宽配额被拒
         val cause = f.rule.cause
-        assertTrue("根因必须点明不是 CPU 故障", cause.contains("不是") && cause.contains("CPU"))
+        assertTrue("根因必须点明不是 CPU 故障", cause.contains("不是 CPU 故障"))
         assertTrue("根因必须点明 entitlement/权限", cause.contains("entitlement"))
-        assertTrue("根因必须点明服务缺失的连锁", cause.contains("XPC 服务") || cause.contains("重试"))
+        assertTrue("不得把 CPU 监控拒绝归因为服务缺失", cause.contains("不是 launchd 的 XPC 服务查找"))
+        assertNull(byId(s, "launchd-failed-lookup"))
         // 影响与处置都必须具体、可执行
         assertTrue("影响要点明不阻塞 SpringBoard", f.rule.impact.contains("SpringBoard") || f.rule.impact.contains("桌面"))
         assertTrue("处置要给出明确动作", f.rule.action.contains("FAST=1") || f.rule.action.contains("不要"))

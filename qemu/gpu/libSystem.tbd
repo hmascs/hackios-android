@@ -1,0 +1,10 @@
+--- !tapi-tbd
+ tbd-version: 4
+ targets: [ arm64-ios ]
+ install-name: '/usr/lib/libSystem.B.dylib'
+ current-version: 1.0
+ compatibility-version: 1.0
+ exports:
+   - targets: [ arm64-ios ]
+     symbols: [ _pthread_create, _pthread_join, _usleep, _mach_absolute_time, _mach_timebase_info, _printf, _malloc, dyld_stub_binder ]
+...

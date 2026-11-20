@@ -7,6 +7,9 @@ import com.android.gudao.iphoneos.engine.QemuAffinity
 import com.android.gudao.iphoneos.engine.QemuFlags
 import com.android.gudao.iphoneos.engine.QemuPreflight
 import com.android.gudao.iphoneos.engine.QemuTopology
+import com.android.gudao.iphoneos.engine.VmDriverContext
+import com.android.gudao.iphoneos.engine.VmDriverSlot
+import com.android.gudao.iphoneos.engine.VmDrivers
 import java.io.File
 import java.io.FileOutputStream
 import java.io.RandomAccessFile
@@ -35,7 +38,10 @@ import java.nio.ByteOrder
  */
 class QemuRunner(private val runDir: File) {
 
-    private var process: Process? = null
+    @Volatile private var process: Process? = null
+    @Volatile private var gpuSession: GpuRuntime.Session? = null
+    @Volatile internal var gpuFailure: String? = null
+        private set
     private var drain: Thread? = null
 
     /**
@@ -123,14 +129,17 @@ class QemuRunner(private val runDir: File) {
             //  - launchd_unsecure_cache=1：launchd 跳过 AMFI 校验直接接纳 job cache，让
             //    mobileactivationd 等按需守护进程在精简镜像里也能注册（直指 lsd 风暴根因）。
             val stabilityArgs = "wdt=-1 wdt_test=no_user_checkin launchd_unsecure_cache=1"
+            // 0.31.0：不再传 bootlog=1。内核叠层只在带这个 boot-arg 时绘制，去掉以后画面就是
+            // 干净的 Apple Logo → 桌面，不再有底部日志面板。串口本身照旧写 serial.log，App 的
+            // 「日志」页仍然能看全过程；要临时恢复叠层，只需在下面的 cmdline 里加回 bootlog=1。
             // virtio_net=1：上游 run-darwin.sh 在开网时用它让 XNU 的 virtio-net 驱动真正接管
             // en0。少了这一条，QEMU 侧网卡与 ROM 都在，但 guest 只停在 "virtio network device
             // in slot …"，接口不 attach、拿不到 DHCP，表现成 Safari「未连接互联网」。
             val cmdline =
                 "loader_return_after=$sessionSecs epoch=${System.currentTimeMillis() / 1000} " +
                     "cpus=${QemuTopology.cpusBootArg(smp)} virtio_input=1 virtio_net=1 " +
-                    "gl=1 fbscale=3 plain_vibrancy=1 " +
-                    stabilityArgs +
+                    "gl=1 fbscale=${Constants.SCREEN_SCALE} plain_vibrancy=1 " +
+                    stabilityArgs + " " +
                     // Diagnostic boot-args come last so they win over the managed ones (XNU keeps the
                     // final value of a repeated key). QemuFlags already refused cpus=/rd=/epoch=.
                     (if (extraBootArgs.isBlank()) "" else " " + extraBootArgs.trim())
@@ -206,7 +215,7 @@ class QemuRunner(private val runDir: File) {
      *  @param hostCores 宿主算力池核数：只影响 `tb-size` 规格与（自检通过时的）CPU 亲和性
      *  掩码，不改变 Guest vCPU 数，也不进 payload / ram.img，所以调它**零重建成本**。
      */
-    fun start(
+    internal fun start(
         smp: Int = Constants.SMP_DEFAULT,
         netEnabled: Boolean = Constants.NET_DEFAULT,
         dnsServers: List<String> = emptyList(),
@@ -221,7 +230,12 @@ class QemuRunner(private val runDir: File) {
         ramGb: Long = Constants.RAM_GB,
         /** TB 翻译缓存（MiB）；null 时按宿主算力池规格（默认 8 核 → 1360 MiB）。 */
         tbMiB: Int? = null,
+        drivers: VmDrivers.Plan = VmDrivers.defaults(netEnabled),
+        dataDisk: IosDataStorage.Attachment? = null,
+        gpu: GpuRuntime.Prepared? = null,
     ) {
+        gpuFailure = null
+        check(gpu == null || smp == 2) { "Adreno 后端需要双核配置" }
         val qemu = File(runDir, Constants.QEMU_BIN_REL)
         val libDir = File(runDir, Constants.QEMU_LIB_REL)
         require(qemu.exists() && qemu.canExecute()) {
@@ -274,6 +288,11 @@ class QemuRunner(private val runDir: File) {
             append("，run 目录可用存储=").append(if (freeMb >= 0) "$freeMb MB" else "未知")
             append("；payload.bin=").append(File(runDir, "payload.bin").length() / 1024).append(" KB")
             append("，ram.img=").append(File(runDir, "ram.img").length() / 1024 / 1024).append(" MB")
+            dataDisk?.let { disk ->
+                append("；数据盘=").append(disk.file.name)
+                append("（").append(disk.sizeBytes / (1L shl 30)).append(" GiB，")
+                append(if (disk.writable) "读写" else "只读").append("，").append(disk.bootArg).append("）")
+            }
         }
         AppLog.i(TAG, lastStartSummary)
         // QEMU 的 guest 内存是 memory-backend-file（share=off），页面被写到 ram.img 时真的吃
@@ -295,6 +314,8 @@ class QemuRunner(private val runDir: File) {
         AppLog.i(TAG, "宿主算力池 $hostCores：${affinity.note}")
         AppLog.i(TAG, "宿主拓扑：${QemuAffinity.describeTopology(hostTopology)}")
 
+        val driverContext = VmDriverContext(userNetdevArg(dnsServers))
+        val gpuLink = gpu?.start()
         val cmd = mutableListOf<String>().apply {
             // 前缀里已经包含 taskset 的语法（util-linux 的 -c / toybox 的十六进制），原样使用。
             addAll(affinity.prefix)
@@ -302,7 +323,8 @@ class QemuRunner(private val runDir: File) {
             // Datadir: where QEMU looks up option ROMs by name (efi-virtio.rom, vgabios-ramfb.bin).
             // Compiled-in default points at the Termux prefix, which does not exist on Android.
             addAll(listOf("-L", shareDir.absolutePath))
-            addAll(listOf("-M", "virt,gic-version=3"))
+            val machine = if (gpuLink != null) "virt-10.1" else "virt"
+            addAll(listOf("-M", "$machine,gic-version=3"))
             addAll(listOf("-cpu", "cortex-a76"))
             // 0.26.0：`-smp` 只由 Guest vCPU 决定（XNU 稳定性），`-accel` 的 TB 缓存
             // 由宿主算力池决定（吞吐）。二者解耦：2 个 vCPU 也能拿到 8 核规格的翻译缓存，
@@ -326,23 +348,30 @@ class QemuRunner(private val runDir: File) {
             // 当成另一个选项名，先警告 "short-form boolean option 'b'" 再报
             // "Invalid parameter 'b'"，机器初始化阶段直接 exit=1（0.29.2 实测踩到的就是这个）。
             // 多个 DNS 在这里没有替代写法，取宿主第一个可用解析器即可。
-            if (netEnabled) {
-                val netdev = userNetdevArg(dnsServers)
-                Log.i(TAG, "start: netdev=$netdev")
-                addAll(listOf("-netdev", netdev))
-                addAll(listOf("-device", "virtio-net-device,netdev=net0"))
-            } else {
-                addAll(listOf("-nic", "none"))
-            }
+            if (gpuLink != null) {
+                // Restricted internal link only: no Internet or host port forwarding.
+                addAll(listOf("-chardev", "socket,id=gpu,path=${gpuLink.socket.absolutePath}",
+                    "-netdev", "user,id=net0,restrict=on,guestfwd=tcp:10.0.2.100:${GpuRuntime.PORT}-chardev:gpu",
+                    "-device", "virtio-net-device,netdev=net0"))
+            } else addAll(drivers.arguments(VmDriverSlot.NETWORK, driverContext))
             addAll(listOf("-drive", "if=pflash,format=raw,readonly=on,file=${File(runDir, Constants.ASSET_UEFI).absolutePath}"))
             addAll(listOf("-drive", "if=pflash,format=raw,file=${File(runDir, Constants.ASSET_VARS).absolutePath}"))
-            addAll(listOf("-drive", "file=fat:rw:${File(runDir, "esp").absolutePath},format=raw,if=virtio"))
+            val esp = File(runDir, "esp").absolutePath
+            if (dataDisk != null) {
+                // The guest block driver accepts the first MMIO block device.
+                // Keep EFI on PCI so rvblk0 can only refer to the selected data disk.
+                addAll(listOf("-drive", "file=fat:rw:$esp,format=raw,if=none,id=hios_esp",
+                    "-device", "virtio-blk-pci,drive=hios_esp,bootindex=1"))
+            } else {
+                addAll(listOf("-drive", "file=fat:rw:$esp,format=raw,if=virtio"))
+            }
             addAll(listOf("-device", "loader,file=${File(runDir, "payload.bin").absolutePath},addr=0x${Constants.LOADER_ADDR.toString(16)},force-raw=on"))
-            addAll(listOf("-object", "memory-backend-file,id=ram,size=${ramGb}G,mem-path=${File(runDir, "ram.img").absolutePath},share=off"))
+            val memoryMode = if (gpuLink != null) ",readonly=on,rom=off,share=off" else ",share=off"
+            addAll(listOf("-object", "memory-backend-file,id=ram,size=${ramGb}G,mem-path=${File(runDir, "ram.img").absolutePath}$memoryMode"))
             addAll(listOf("-machine", "memory-backend=ram"))
             addAll(listOf("-global", "virtio-mmio.force-legacy=false"))
-            addAll(listOf("-device", "virtio-tablet-device"))
-            addAll(listOf("-device", "virtio-keyboard-device"))
+            addAll(drivers.arguments(VmDriverSlot.INPUT, driverContext))
+            dataDisk?.let { addAll(it.qemuArgs) }
             // Display device: `ramfb`, exactly like the upstream project's run.sh. It has no
             // xres/yres properties (QEMU rejects them outright) and needs none: the loader
             // reshapes it to the iPhone X panel over the fw_cfg "etc/ramfb" DMA channel, so the
@@ -355,7 +384,7 @@ class QemuRunner(private val runDir: File) {
             // loader bailed out believing the DMA had failed. The GOP's 800x600 mode then stayed
             // in place while iOS rendered into a framebuffer it was told was 1125x2436 -- a
             // black screen. assets/loader.efi is rebuilt from the same source with `volatile`.
-            addAll(listOf("-device", "ramfb"))
+            addAll(drivers.arguments(VmDriverSlot.DISPLAY, driverContext))
             addAll(listOf("-monitor", "tcp:127.0.0.1:${Constants.MON_PORT},server,nowait"))
             addAll(listOf("-qmp", "tcp:127.0.0.1:${Constants.QMP_PORT},server,nowait"))
             addAll(listOf("-display", "none"))
@@ -366,7 +395,7 @@ class QemuRunner(private val runDir: File) {
         Log.i(TAG, "start: ${cmd.joinToString(" ")}")
         AppLog.i(TAG, "启动 QEMU：${QemuTopology.describe(smp, hostCores, mttcg)} " +
             "亲和性=${if (lastAffinityApplied) "已启用 ${lastAffinityMask}" else "降级（仅 TB 缓存）"} " +
-            "net=$netEnabled。${cmd.joinToString(" ")}")
+            "驱动=${drivers.describe()}。${cmd.joinToString(" ")}")
         // Keep the exact argv next to the log: the console panel can show what was attempted even
         // when QEMU dies before writing a single byte.
         runCatching { File(runDir, "qemu-cmdline.txt").writeText(cmd.joinToString(" ")) }
@@ -384,7 +413,26 @@ class QemuRunner(private val runDir: File) {
         // 「文件存在」就等价于「QEMU 真的走到串口初始化」。
         runCatching { serialLog().delete() }
         val log = qemuLog()
-        process = pb.start()
+        val launched = try { pb.start() } catch (e: Exception) {
+            gpuLink?.close()
+            throw e
+        }
+        gpuSession = gpuLink
+        process = launched
+        if (gpuLink != null) Thread({
+            try {
+                while (!launched.waitFor(300, java.util.concurrent.TimeUnit.MILLISECONDS)) {
+                    if (gpuSession !== gpuLink) break
+                    val failure = gpuLink.failure() ?: continue
+                    gpuFailure = failure
+                    AppLog.w(TAG, failure)
+                    launched.destroyForcibly()
+                    break
+                }
+            } finally {
+                gpuLink.close()
+            }
+        }, "gpu-worker-watch").apply { isDaemon = true; start() }
         AppLog.i(TAG, "QEMU 进程已启动")
         // Drain stdout+stderr into qemu.log. Without this the child's error message stays in an
         // unread pipe and the process can even block once the 64 KB buffer fills.
@@ -412,6 +460,12 @@ class QemuRunner(private val runDir: File) {
 
     fun isRunning(): Boolean = process?.isAlive == true
 
+    /**
+     * A6 帧环文件。没有 Adreno worker、或 [Constants.FRAME_RING_ENABLED] 关闭时为空，
+     * 上层据此决定 CapturePipeline 走 screendump 还是帧环。
+     */
+    fun gpuFrameRing(): File? = gpuSession?.frameRing
+
     /** Exit status once the process is gone, null while it is still running (or never started). */
     fun exitCode(): Int? {
         val p = process ?: return null
@@ -424,7 +478,10 @@ class QemuRunner(private val runDir: File) {
         if (p != null) {
             AppLog.w(TAG, "停止 QEMU：此前存活=${p.isAlive}，退出码=${runCatching { p.exitValue() }.getOrNull()}")
         }
+        val previous = gpuSession
+        gpuSession = null
         p?.destroyForcibly()
+        previous?.close()
         process = null
     }
 

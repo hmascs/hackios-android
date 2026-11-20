@@ -75,6 +75,12 @@ object StoragePaths {
     /** Download/hackios/images (or the private fallback). */
     fun imagesDir(context: Context): File = File(root(context), Constants.PUBLIC_IMAGES_SUBDIR).apply { mkdirs() }
 
+    /** Stable path for the user's persistent disk. No private fallback: losing public access
+     * must not silently replace existing iOS data with an empty disk. Does not create or mount it. */
+    fun iosDataDiskLocation(context: Context): File? = publicRoot(context)?.let {
+        File(File(it, Constants.PUBLIC_DISKS_SUBDIR), Constants.IOS_DATA_DISK_NAME)
+    }
+
     /** The IPSW as it is expected in ipswDir. */
     fun ipswFile(context: Context): File = File(ipswDir(context), Constants.IPSW_FILENAME)
 

@@ -1024,8 +1024,8 @@ private fun buildSpecs(allowWrite: Boolean, fullAccess: Boolean): JSONArray = JS
     put(tool(
         "perf_stats",
         "Read the 0.25.0 CPU-spin report written each time the boot phase advances: " +
-            "adaptive frame pacing (2 FPS while booting, 8 FPS when the screen is active, " +
-            "1 FPS when static, backoff when a screendump is slow), the current boot stage, " +
+            "a 60 FPS request budget in both boot and desktop (no artificial stage/idle cap), " +
+            "backoff when a screendump is slow, the measured fps, the current boot stage, " +
             "capture cost, and the FAST-boot recipe in use. Use it to verify that the App is " +
             "not competing with QEMU's TCG threads for CPU.",
         empty(),

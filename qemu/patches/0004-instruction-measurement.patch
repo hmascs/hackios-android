@@ -1,0 +1,361 @@
+--- a/include/hw/core/cpu.h
++++ b/include/hw/core/cpu.h
+@@ -489,6 +489,7 @@
+     int64_t icount_budget;
+     int64_t icount_extra;
+     uint64_t random_seed;
++    struct HiosProfileState *hios_profile; /* diagnostic, per-vCPU, not migrated */
+     sigjmp_buf jmp_env;
+ 
+     QemuMutex work_mutex;
+--- /dev/null
++++ b/include/exec/hios-profile.h
+@@ -0,0 +1,65 @@
++/* SPDX-License-Identifier: GPL-2.0-or-later */
++#ifndef EXEC_HIOS_PROFILE_H
++#define EXEC_HIOS_PROFILE_H
++
++/* Diagnostic-only, per-vCPU accounting.  Generated A64 TBs charge their static
++ * length at entry (including direct chains). restore_state subtracts the unused
++ * tail. A longjmp without restore records the whole last credit as uncertain:
++ * [credited - uncertain, credited] is the stated instruction-count interval.
++ * This is not a PMU retired-instruction counter and includes firmware/kernel.
++ * Read these fields only after all vCPUs have stopped.  No live global counters.
++ */
++typedef struct HiosProfileBucket {
++    uint64_t instructions;
++    uint64_t uncertain;
++    uint64_t address;
++} HiosProfileBucket;
++
++typedef struct HiosProfileState {
++    uint64_t instructions[2]; /* EL0, then EL1+ (not address-based guessing) */
++    uint64_t blocks[2];
++    uintptr_t active_tb;
++    uint64_t active_credit;
++    uint64_t active_class;
++    HiosProfileBucket *active_bucket;
++    uint64_t uncertain[2];
++    uint64_t corrected_tail;
++    uint64_t corrections;
++    uint64_t unbounded_exits;
++    uint64_t translations;
++    int mode; /* 1 = inline totals, 2 = totals + slower full-VA bucket helper */
++    GHashTable *buckets;
++} HiosProfileState;
++
++static inline void hios_profile_restore(CPUState *cpu, const void *tb,
++                                        unsigned insns_left)
++{
++    HiosProfileState *state = cpu->hios_profile;
++    if (!state || !state->active_credit || state->active_tb != (uintptr_t)tb) {
++        return;
++    }
++    assert(insns_left <= state->active_credit);
++    state->instructions[state->active_class] -= insns_left;
++    if (state->active_bucket) {
++        state->active_bucket->instructions -= insns_left;
++    }
++    state->corrected_tail += insns_left;
++    state->corrections++;
++    state->active_credit = 0;
++}
++
++static inline void hios_profile_longjmp(CPUState *cpu)
++{
++    HiosProfileState *state = cpu->hios_profile;
++    if (!state || !state->active_credit) {
++        return;
++    }
++    state->uncertain[state->active_class] += state->active_credit;
++    if (state->active_bucket) {
++        state->active_bucket->uncertain += state->active_credit;
++    }
++    state->unbounded_exits++;
++    state->active_credit = 0;
++}
++
++#endif
+--- a/accel/tcg/cpu-exec.c
++++ b/accel/tcg/cpu-exec.c
+@@ -22,6 +22,7 @@
+ #include "qapi/error.h"
+ #include "qapi/type-helpers.h"
+ #include "hw/core/cpu.h"
++#include "exec/hios-profile.h"
+ #include "accel/tcg/cpu-ops.h"
+ #include "trace.h"
+ #include "exec/cpu-common.h"
+@@ -420,6 +421,9 @@
+ 
+     qemu_thread_jit_execute();
+     ret = tcg_qemu_tb_exec(cpu_env(cpu), tb_ptr);
++    if (cpu->hios_profile) {
++        cpu->hios_profile->active_credit = 0;
++    }
+     cpu->neg.can_do_io = true;
+     /*
+      * TODO: Delay swapping back to the read-write region of the TB
+@@ -497,6 +501,7 @@
+ {
+     /* Non-buggy compilers preserve this; assert the correct value. */
+     assert(cpu == current_cpu);
++    hios_profile_longjmp(cpu);
+ 
+     /*
+      * For softmmu, a tlb_fill fault during translation will land here,
+@@ -1018,6 +1023,17 @@
+         tcg_target_initialized = true;
+     }
+ 
++    const char *profile_mode = getenv("HIOS_PROFILE");
++    if (profile_mode && (strcmp(profile_mode, "1") == 0 ||
++                         strcmp(profile_mode, "2") == 0)) {
++        cpu->hios_profile = g_new0(HiosProfileState, 1);
++        cpu->hios_profile->mode = profile_mode[0] - '0';
++        if (cpu->hios_profile->mode == 2) {
++            cpu->hios_profile->buckets = g_hash_table_new_full(g_int64_hash,
++                                                              g_int64_equal,
++                                                              g_free, g_free);
++        }
++    }
+     cpu->tb_jmp_cache = g_new0(CPUJumpCache, 1);
+     tlb_init(cpu);
+     tcg_iommu_init_notifier_list(cpu);
+@@ -1031,5 +1047,12 @@
+     tcg_iommu_free_notifier_list(cpu);
+ 
+     tlb_destroy(cpu);
++    if (cpu->hios_profile) {
++        if (cpu->hios_profile->buckets) {
++            g_hash_table_destroy(cpu->hios_profile->buckets);
++        }
++        g_free(cpu->hios_profile);
++        cpu->hios_profile = NULL;
++    }
+     g_free_rcu(cpu->tb_jmp_cache, rcu);
+ }
+--- a/accel/tcg/translate-all.c
++++ b/accel/tcg/translate-all.c
+@@ -27,6 +27,7 @@
+ #include "qemu/target-info.h"
+ #include "exec/log.h"
+ #include "exec/icount.h"
++#include "exec/hios-profile.h"
+ #include "accel/tcg/cpu-ops.h"
+ #include "tb-jmp-cache.h"
+ #include "tb-hash.h"
+@@ -188,6 +189,7 @@
+         cpu->neg.icount_decr.u16.low += insns_left;
+     }
+ 
++    hios_profile_restore(cpu, tb, insns_left);
+     cpu->cc->tcg_ops->restore_state_to_opc(cpu, tb, data);
+ }
+ 
+@@ -514,6 +516,9 @@
+      * No explicit memory barrier is required -- tb_link_page() makes the
+      * TB visible in a consistent state.
+      */
++    if (cpu->hios_profile) {
++        cpu->hios_profile->translations++;
++    }
+     existing_tb = tb_link_page(tb);
+     assert_no_pages_locked();
+ 
+--- a/accel/tcg/tcg-stats.c
++++ b/accel/tcg/tcg-stats.c
+@@ -13,6 +13,8 @@
+ #include "system/cpu-timers.h"
+ #include "exec/icount.h"
+ #include "hw/core/cpu.h"
++#include "exec/hios-profile.h"
++#include "system/runstate.h"
+ #include "tcg/tcg.h"
+ #include "internal-common.h"
+ #include "tb-context.h"
+@@ -206,11 +208,52 @@
+     tcg_dump_flush_info(buf);
+ }
+ 
++static void hios_profile_dump(GString *buf)
++{
++    CPUState *cpu;
++
++    if (runstate_is_running()) {
++        g_string_append(buf, "HIOS_PROFILE_UNAVAILABLE pause-vcpus-first\n");
++        return;
++    }
++    CPU_FOREACH(cpu) {
++        HiosProfileState *state = cpu->hios_profile;
++        if (!state) {
++            continue;
++        }
++        g_string_append_printf(buf,
++            "HIOS_PROFILE {\"cpu\":%d,\"mode\":%d,"
++            "\"user_instructions\":%"PRIu64",\"kernel_instructions\":%"PRIu64","
++            "\"user_blocks\":%"PRIu64",\"kernel_blocks\":%"PRIu64","
++            "\"user_uncertain\":%"PRIu64",\"kernel_uncertain\":%"PRIu64","
++            "\"corrected_tail\":%"PRIu64",\"corrections\":%"PRIu64","
++            "\"unbounded_exits\":%"PRIu64",\"translations\":%"PRIu64"}\n",
++            cpu->cpu_index, state->mode, state->instructions[0],
++            state->instructions[1], state->blocks[0], state->blocks[1],
++            state->uncertain[0], state->uncertain[1], state->corrected_tail,
++            state->corrections, state->unbounded_exits, state->translations);
++        if (state->buckets) {
++            GHashTableIter iterator;
++            gpointer key, value;
++            g_hash_table_iter_init(&iterator, state->buckets);
++            while (g_hash_table_iter_next(&iterator, &key, &value)) {
++                HiosProfileBucket *bucket = value;
++                g_string_append_printf(buf,
++                    "HIOS_BUCKET {\"cpu\":%d,\"address\":\"0x%016"PRIx64"\","
++                    "\"instructions\":%"PRIu64",\"uncertain\":%"PRIu64"}\n",
++                    cpu->cpu_index, bucket->address, bucket->instructions,
++                    bucket->uncertain);
++            }
++        }
++    }
++}
++
+ void tcg_get_stats(AccelState *accel, GString *buf)
+ {
+     dump_accel_info(accel, buf);
+     dump_exec_info(buf);
+     dump_drift_info(buf);
++    hios_profile_dump(buf);
+ }
+ 
+ void tcg_dump_stats(GString *buf)
+--- a/target/arm/tcg/translate.h
++++ b/target/arm/tcg/translate.h
+@@ -86,6 +86,10 @@
+      */
+     uint32_t svc_imm;
+     int current_el;
++    /* Placeholder ops patched to the final TB length, diagnostics only. */
++    TCGOp *hios_count_add;
++    TCGOp *hios_credit_store;
++    TCGOp *hios_bucket_add;
+     ARMCPRegTable_ptr cp_regs;
+     uint64_t features; /* CPU features bits */
+     bool aarch64;
+--- a/target/arm/tcg/translate-a64.c
++++ b/target/arm/tcg/translate-a64.c
+@@ -18,6 +18,7 @@
+  */
+ #include "qemu/osdep.h"
+ #include "exec/target_page.h"
+ #include "tcg/tcg-op-common.h"
+ #include "translate.h"
++#include "exec/hios-profile.h"
+ #include "translate-a64.h"
+@@ -10291,6 +10292,47 @@
+ 
+ static void aarch64_tr_tb_start(DisasContextBase *db, CPUState *cpu)
+ {
++    DisasContext *dc = container_of(db, DisasContext, base);
++    unsigned cls = dc->current_el != 0;
++    TCGv_ptr state;
++    TCGv_i64 value;
++    ptrdiff_t count_offset = offsetof(HiosProfileState, instructions) + cls * 8;
++    ptrdiff_t block_offset = offsetof(HiosProfileState, blocks) + cls * 8;
++
++    dc->hios_count_add = dc->hios_credit_store = dc->hios_bucket_add = NULL;
++    if (!cpu->hios_profile) {
++        return;
++    }
++    /* This code executes inside every generated TB, after the IRQ check.
++     * goto_tb/goto_ptr chains arrive here too. No per-instruction hook. */
++    state = tcg_temp_new_ptr();
++    value = tcg_temp_new_i64();
++    if (cpu->hios_profile->mode == 2) {
++        TCGv_ptr bucket = tcg_temp_new_ptr();
++        TCGv_i64 address = tb_cflags(db->tb) & CF_PCREL
++                          ? cpu_pc : tcg_constant_i64(db->pc_first);
++        gen_helper_hios_profile_bucket(bucket, tcg_env, address);
++        tcg_gen_ld_i64(value, bucket, offsetof(HiosProfileBucket, instructions));
++        tcg_gen_addi_i64(value, value, 1);
++        dc->hios_bucket_add = tcg_last_op();
++        tcg_gen_st_i64(value, bucket, offsetof(HiosProfileBucket, instructions));
++    }
++    tcg_gen_ld_ptr(state, tcg_env,
++                   offsetof(CPUState, hios_profile) - sizeof(CPUState));
++    tcg_gen_ld_i64(value, state, count_offset);
++    tcg_gen_addi_i64(value, value, 1);
++    dc->hios_count_add = tcg_last_op();
++    tcg_gen_st_i64(value, state, count_offset);
++    tcg_gen_ld_i64(value, state, block_offset);
++    tcg_gen_addi_i64(value, value, 1);
++    tcg_gen_st_i64(value, state, block_offset);
++    tcg_gen_st_ptr(tcg_constant_ptr(db->tb), state,
++                   offsetof(HiosProfileState, active_tb));
++    tcg_gen_st_i64(tcg_constant_i64(1), state,
++                   offsetof(HiosProfileState, active_credit));
++    dc->hios_credit_store = tcg_last_op();
++    tcg_gen_st_i64(tcg_constant_i64(cls), state,
++                   offsetof(HiosProfileState, active_class));
+ }
+ 
+ static void aarch64_tr_insn_start(DisasContextBase *dcbase, CPUState *cpu)
+@@ -10409,6 +10451,15 @@
+ static void aarch64_tr_tb_stop(DisasContextBase *dcbase, CPUState *cpu)
+ {
+     DisasContext *dc = container_of(dcbase, DisasContext, base);
++
++    if (dc->hios_count_add) {
++        TCGArg count = tcgv_i64_arg(tcg_constant_i64(dcbase->num_insns));
++        tcg_set_insn_param(dc->hios_count_add, 2, count);
++        tcg_set_insn_param(dc->hios_credit_store, 0, count);
++        if (dc->hios_bucket_add) {
++            tcg_set_insn_param(dc->hios_bucket_add, 2, count);
++        }
++    }
+ 
+     if (unlikely(dc->ss_active)) {
+         /* Note that this means single stepping WFI doesn't halt the CPU.
+--- a/target/arm/tcg/helper-a64.h
++++ b/target/arm/tcg/helper-a64.h
+@@ -16,6 +16,7 @@
+  * You should have received a copy of the GNU Lesser General Public
+  * License along with this library; if not, see <http://www.gnu.org/licenses/>.
+  */
++DEF_HELPER_2(hios_profile_bucket, ptr, env, i64)
+ DEF_HELPER_FLAGS_2(udiv64, TCG_CALL_NO_RWG_SE, i64, i64, i64)
+ DEF_HELPER_FLAGS_2(sdiv64, TCG_CALL_NO_RWG_SE, s64, s64, s64)
+ DEF_HELPER_FLAGS_1(rbit64, TCG_CALL_NO_RWG_SE, i64, i64)
+--- a/target/arm/tcg/helper-a64.c
++++ b/target/arm/tcg/helper-a64.c
+@@ -29,6 +29,7 @@
+ #include "internals.h"
+ #include "qemu/crc32c.h"
+ #include "exec/cpu-common.h"
++#include "exec/hios-profile.h"
+ #include "accel/tcg/cpu-ldst.h"
+ #include "accel/tcg/probe.h"
+ #include "exec/target_page.h"
+@@ -39,6 +40,24 @@
+ #include <zlib.h> /* for crc32 */
+ #include "vec_internal.h"
+ #include "WKdm.h"
++
++/* Mode 2 only: full runtime VA, including CF_PCREL aliases.  No modulo key,
++ * no cross-vCPU mutation and no sampling multiplier.  Kept off in mode 1. */
++void *HELPER(hios_profile_bucket)(CPUARMState *env, uint64_t pc)
++{
++    HiosProfileState *state = env_cpu(env)->hios_profile;
++    uint64_t key = pc & ~UINT64_C(0x3fffff);
++    HiosProfileBucket *bucket = g_hash_table_lookup(state->buckets, &key);
++    if (!bucket) {
++        uint64_t *owned_key = g_new(uint64_t, 1);
++        *owned_key = key;
++        bucket = g_new0(HiosProfileBucket, 1);
++        bucket->address = key;
++        g_hash_table_insert(state->buckets, owned_key, bucket);
++    }
++    state->active_bucket = bucket;
++    return bucket;
++}
+ 
+ /* C2.4.7 Multiply and divide */
+ /* special cases for 0 and LLONG_MIN are mandated by the standard */

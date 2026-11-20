@@ -1,5 +1,6 @@
 package com.android.gudao.iphoneos
 
+import com.android.gudao.iphoneos.engine.QemuPpm
 import android.graphics.Bitmap
 import android.util.Log
 import com.android.gudao.iphoneos.engine.AppLog
@@ -17,9 +18,8 @@ import kotlin.math.roundToInt
 /**
  * One decoded guest frame: pixels plus the numbers that say whether the picture is real.
  *
- * [mean] is the mean of r+g+b over the frame, 0..765. 0 means the guest never drew anything into
- * ramfb, which separates "the capture path is broken" from "there is genuinely nothing on the
- * guest screen" — two states that looked identical on screen before.
+ * [mean] is the mean intensity per channel, 0..255. Near zero means the sampled pixels are mostly
+ * black; it does not by itself establish whether the guest has rendered or reached its desktop.
  */
 data class FrameInfo(
     val bitmap: Bitmap,
@@ -36,6 +36,11 @@ data class FrameInfo(
      * 后者正是「连接不稳定」时用户看到的静止画面。
      */
     val signature: Long = 0L,
+    val sceneHasContent: Boolean = false,
+    /** QEMU 侧 screendump 的耗时（含写盘），与 App 的解码分开，20 FPS 的目标要先看这一段。 */
+    val dumpMs: Long = 0L,
+    /** App 侧 PPM 解码 + setPixels 的耗时。 */
+    val decodeMs: Long = 0L,
 )
 
 /**
@@ -71,7 +76,7 @@ class QemuControl {
 
     /**
      * 0.25.0：复用 PPM 解码的两个大缓冲。旧实现每帧 `ppm.readBytes()` 分配 8 MB，
-     * 再 `IntArray(cw*ch)` 分配约 11 MB；8 FPS 就是 ~150 MB/s 的临时对象，GC 线程
+     * 再 `IntArray(cw*ch)` 分配约 11 MB；旧 8 FPS 就是 ~150 MB/s 的临时对象，GC 线程
      * 与 QEMU 的 vCPU 线程抢核，正是「CPU 空转」在宿主侧的形态。两个数组只在
      * [captureFrame] 的同步块里使用（hmpLock 串行化），复用是安全的。
      */
@@ -323,12 +328,17 @@ class QemuControl {
     fun captureFrame(ppmPath: File, reuse: Bitmap? = null): FrameInfo? = synchronized(hmpLock) {
         val started = System.currentTimeMillis()
         if (!hmpScreendump(ppmPath)) return null
-        val frame = decodePpm(ppmPath, reuse)
-        val cost = System.currentTimeMillis() - started
+        val dumped = System.currentTimeMillis()
+        val frame = decodePpm(ppmPath, reuse) ?: return null
+        val decoded = System.currentTimeMillis()
+        val cost = decoded - started
+        val dumpMs = dumped - started
+        val decodeMs = decoded - dumped
         if (cost > SLOW_CAPTURE_MS) {
-            AppLog.w(TAG, "取帧耗时 ${cost}ms（guest 忙或 PPM ${runCatching { ppmPath.length() }.getOrDefault(0L) / 1024}KB）")
+            AppLog.w(TAG, "取帧耗时 ${cost}ms（截屏 ${dumpMs}ms + 解码 ${decodeMs}ms，" +
+                "PPM ${runCatching { ppmPath.length() }.getOrDefault(0L) / 1024}KB）")
         }
-        frame
+        frame.copy(dumpMs = dumpMs, decodeMs = decodeMs)
     }
 
     /**
@@ -408,7 +418,7 @@ class QemuControl {
     private fun decodePpm(ppm: File, reuse: Bitmap?): FrameInfo? {
         // 读到复用缓冲里：文件长度变化时按需要扩容，之后一直复用同一块内存。
         val fileLen = runCatching { ppm.length().toInt() }.getOrDefault(0)
-        if (fileLen < 15 || fileLen > PPM_MAX_BYTES) return null
+        if (fileLen < 14 || fileLen > PPM_MAX_BYTES) return null
         var buf = ppmBytes
         if (buf == null || buf.size < fileLen) {
             buf = ByteArray(fileLen)
@@ -428,33 +438,11 @@ class QemuControl {
         } catch (t: Throwable) {
             return null
         }
-        if (len < 15) return null
-        var i = 0
-        if (bytes[0] != 'P'.code.toByte() || bytes[1] != '6'.code.toByte()) return null
-        i = 2
-        fun token(): String {
-            while (i < len && (bytes[i] == ' '.code.toByte() || bytes[i] == '\n'.code.toByte() ||
-                        bytes[i] == '\r'.code.toByte() || bytes[i] == '\t'.code.toByte())
-            ) i++
-            val start = i
-            while (i < len && bytes[i] != ' '.code.toByte() && bytes[i] != '\n'.code.toByte() &&
-                bytes[i] != '\r'.code.toByte() && bytes[i] != '\t'.code.toByte()
-            ) i++
-            return String(bytes, start, i - start)
-        }
-        val w = token().toIntOrNull() ?: return null
-        val h = token().toIntOrNull() ?: return null
-        token()                                            // maxval
-        while (i < len && (bytes[i] == ' '.code.toByte() || bytes[i] == '\n'.code.toByte() ||
-                    bytes[i] == '\r'.code.toByte() || bytes[i] == '\t'.code.toByte())
-        ) i++
-        if (i >= len || w <= 0 || h <= 0) return null
-
+        val layout = QemuPpm.layout(bytes, len) ?: return null
+        val w = layout.width
+        val h = layout.height
         val cw = minOf(w, Constants.SCREEN_W)
         val ch = minOf(h, Constants.SCREEN_H)
-        val stride = (len - i) / h
-        if (stride < cw * 3) return null
-        if (len - i < (ch - 1) * stride + cw * 3) return null
 
         val target = if (reuse != null && reuse.width == cw && reuse.height == ch && !reuse.isRecycled) {
             reuse
@@ -463,30 +451,9 @@ class QemuControl {
         }
         val px = pixelBuf?.takeIf { it.size == cw * ch }
             ?: IntArray(cw * ch).also { pixelBuf = it }
-        var sum = 0L
-        // ~28k samples per frame is enough to tell two screens apart and costs microseconds.
-        val step = ((cw.toLong() * ch) / 28_000L).coerceAtLeast(1L).toInt()
-        var countdown = 0
-        var hash = -0x340d631b7bdddcdbL
-        for (y in 0 until ch) {
-            val base = i + y * stride
-            val out = y * cw
-            for (x in 0 until cw) {
-                val p = base + x * 3
-                val r = bytes[p].toInt() and 0xff
-                val g = bytes[p + 1].toInt() and 0xff
-                val b = bytes[p + 2].toInt() and 0xff
-                val argb = (0xff shl 24) or (r shl 16) or (g shl 8) or b
-                px[out + x] = argb
-                sum += (r + g + b).toLong()
-                if (countdown-- <= 0) {
-                    hash = (hash xor (argb.toLong() and 0xffffffffL)) * 0x100000001b3L
-                    countdown = step
-                }
-            }
-        }
+        val stats = QemuPpm.decode(bytes, layout, cw, ch, px)
         target.setPixels(px, 0, cw, 0, 0, cw, ch)
-        return FrameInfo(target, cw, ch, w, h, (sum / (cw.toLong() * ch * 3)).toInt(), hash)
+        return FrameInfo(target, cw, ch, w, h, stats.mean, stats.signature, stats.sceneHasContent)
     }
 
     companion object {

@@ -25,7 +25,7 @@ import androidx.compose.ui.unit.dp
  */
 enum class Glyph {
     Power, Lock, VolumeUp, VolumeDown, Screen, Cpu, Network, Folder, Terminal, Doc,
-    ChevronRight, Check, SwipeUp, Circle, Download, Port, Send, Stop,
+    ChevronRight, Check, SwipeUp, Circle, Download, Port, Send, Stop, Alert,
 }
 
 @Composable
@@ -179,6 +179,14 @@ fun IosGlyph(
             Glyph.Check -> {
                 line(5f, 12.5f, 10f, 17.2f)
                 line(10f, 17.2f, 19f, 6.8f)
+            }
+
+            // Error / failure. The toast used to draw Glyph.Lock for errors, which reads as
+            // "locked", not "something went wrong".
+            Glyph.Alert -> {
+                drawCircle(tint, radius = 8.5f * s, center = p(12f, 12f), style = st)
+                line(12f, 7f, 12f, 13f)
+                drawCircle(tint, radius = 1.1f * s, center = p(12f, 16.4f))
             }
 
             Glyph.SwipeUp -> {

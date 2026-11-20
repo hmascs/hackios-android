@@ -1,0 +1,107 @@
+--- a/target/arm/helper.c
++++ b/target/arm/helper.c
+@@ -22,6 +22,7 @@
+ #include "hw/irq.h"
+ #include "system/cpu-timers.h"
+ #include "exec/icount.h"
++#include "exec/replay-core.h"
+ #include "system/kvm.h"
+ #include "system/tcg.h"
+ #include "qapi/error.h"
+@@ -1281,11 +1282,95 @@
+     }
+ }
+ 
++/*
++ * hios: CNTVCT_EL0 is this guest's only timebase.  XNU reads it from every
++ * lock spin, every kernel entry (recount), every context switch and every
++ * gettimeofday -- measured on the phone, ~47% of all guest CPU time sat in
++ * ml_get_timebase() + ml_get_speculative_timebase().  The stock expression
++ * below costs a host clock read (~70us via this proot) plus two runtime
++ * 64-bit divisions per read.
++ *
++ * The host's own virtual counter, CNTVCT_EL0, is the same monotonic clock
++ * QEMU_CLOCK_VIRTUAL resolves to (without icount/replay it is just the host
++ * monotonic clock) and reading it costs a few nanoseconds.  So scale it:
++ *
++ *     guest_ticks = guest_base + (host_ticks - host_base) * guest_hz / host_hz
++ *
++ * with the ratio precomputed as a 2^40 fixed point multiplier -- one 128-bit
++ * multiply and shift, exact to well under one tick per hour, monotonic, and
++ * with no staleness at all (unlike a cache window, which would quantise the
++ * guest's clock).  HIOS_CNTVCT_FAST=0 restores stock behaviour.
++ */
++static struct {
++    uint64_t host_base;
++    uint64_t guest_base;
++    uint64_t mult;
++    bool fast;
++} hios_cnt;
++static int hios_cnt_state;      /* 0 = unset, 1 = initialising, 2 = ready */
++
++static inline uint64_t hios_host_ticks(void)
++{
++#if defined(__aarch64__)
++    uint64_t value;
++    __asm__ __volatile__("mrs %0, cntvct_el0" : "=r"(value));
++    return value;
++#else
++    return 0;
++#endif
++}
++
++static uint64_t hios_stock_countervalue(ARMCPU *cpu)
++{
++    return qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) / gt_cntfrq_period_ns(cpu);
++}
++
++static void hios_cnt_setup(ARMCPU *cpu)
++{
++    const char *disable = getenv("HIOS_CNTVCT_FAST");
++    uint64_t host_hz = 0;
++
++    if (disable && *disable == '0') {
++        return;
++    }
++    if (icount_enabled() || replay_mode != REPLAY_MODE_NONE) {
++        return;
++    }
++#if defined(__aarch64__)
++    __asm__ __volatile__("mrs %0, cntfrq_el0" : "=r"(host_hz));
++#endif
++    if (!host_hz || !cpu->gt_cntfrq_hz) {
++        return;
++    }
++    hios_cnt.mult = (uint64_t)(((__uint128_t)cpu->gt_cntfrq_hz << 40) / host_hz);
++    if (!hios_cnt.mult) {
++        return;
++    }
++    hios_cnt.guest_base = hios_stock_countervalue(cpu);
++    hios_cnt.host_base = hios_host_ticks();
++    hios_cnt.fast = true;
++}
++
+ uint64_t gt_get_countervalue(CPUARMState *env)
+ {
+     ARMCPU *cpu = env_archcpu(env);
+ 
+-    return qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) / gt_cntfrq_period_ns(cpu);
++    if (__builtin_expect(__atomic_load_n(&hios_cnt_state, __ATOMIC_ACQUIRE) != 2, 0)) {
++        int unset = 0;
++        if (!__atomic_compare_exchange_n(&hios_cnt_state, &unset, 1, false,
++                                         __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) {
++            /* Another vCPU is anchoring the scale right now. */
++            return hios_stock_countervalue(cpu);
++        }
++        hios_cnt_setup(cpu);
++        __atomic_store_n(&hios_cnt_state, 2, __ATOMIC_RELEASE);
++    }
++    if (__builtin_expect(hios_cnt.fast, 1)) {
++        uint64_t delta = hios_host_ticks() - hios_cnt.host_base;
++        return hios_cnt.guest_base +
++               (uint64_t)(((__uint128_t)delta * hios_cnt.mult) >> 40);
++    }
++    return hios_stock_countervalue(cpu);
+ }
+ 
+ static void gt_update_irq(ARMCPU *cpu, int timeridx)

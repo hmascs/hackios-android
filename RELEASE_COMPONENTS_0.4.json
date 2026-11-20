@@ -1,0 +1,39 @@
+{
+  "version_name": "0.4",
+  "version_code": 68,
+  "application_id": "com.android.gudao.iphoneos",
+  "APK_sha256": "f00dd575895404a3eec155a6fea63449cc284f5fd3e9fd67741a6aeb274885ce",
+  "APK_bytes": 186996834,
+  "certificate_sha256": [
+    "72d727d4a17f7db6d93295ae7e9879b1595b1ecf66ca1921bef8343649b330a7"
+  ],
+  "unit_tests": {
+    "tests": 376,
+    "errors": 0,
+    "failures": 0,
+    "skipped": 0
+  },
+  "kernel_sha256": "7b1f908324fa13154c065f917555852406ddfbfc654f6c247c78c6d6a0644f17",
+  "GPU_assets": {
+    "gpu-android-arm64.zip": {
+      "sha256": "03116c2e60530277d788aeb8ff26ec97312124d6ebeca34b13cec9e6b48259e2",
+      "bytes": 52814082,
+      "origin": "verified APK gpuAssetsDir; release APK entry equal"
+    },
+    "gpu-libredwood-gl.dylib": {
+      "sha256": "13d6431ce875ba2c3efb3ef139882e6a614ff3aada0d21ebddf333da3959e74b",
+      "bytes": 559680,
+      "origin": "verified APK gpuAssetsDir; release APK entry equal"
+    },
+    "gpu-stage-archive.py": {
+      "sha256": "2c046f51051ed3f792892644255fb80a4af3dd78c3948984f037bbeedacd00f7",
+      "bytes": 5182,
+      "origin": "verified APK gpuAssetsDir; release APK entry equal"
+    }
+  },
+  "HTB1_guest_sha256": "13d6431ce875ba2c3efb3ef139882e6a614ff3aada0d21ebddf333da3959e74b",
+  "HTB1_worker_sha256": "cc7ffe7cfa00afa921298aac0f4f2ce1821ff05d5a4776f5096a82a03645c4a3",
+  "native_regression": "9 shader cases identical pixels/GLerrors; 201 off vs153 on requests; legacy c371 fallback202; not system FPS",
+  "rebuilt_in_source_staging": false,
+  "signing_keys_included": false
+}

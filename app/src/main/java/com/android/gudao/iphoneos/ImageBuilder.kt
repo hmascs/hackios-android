@@ -6,7 +6,12 @@ import com.android.gudao.iphoneos.engine.SevenZipProgress
 import com.android.gudao.iphoneos.engine.TailText
 import java.io.File
 import java.io.FileOutputStream
+import java.nio.file.Files
+import java.nio.file.LinkOption.NOFOLLOW_LINKS
+import java.nio.file.StandardCopyOption.ATOMIC_MOVE
+import java.security.MessageDigest
 import java.util.zip.ZipFile
+import kotlinx.coroutines.CancellationException
 
 /**
  * Builds the iOS 16.5 system images **on the phone**, with the HackiOS project's own scripts and
@@ -153,6 +158,24 @@ class ImageBuilder(private val context: Context) {
         }
         stage = "publish"
         val images = collect(publishDir, progress)
+        if (context.assets.list("")?.contains(GPU_DYLIB_ASSET) == true) {
+            // This must precede cleanup(): the private staged root disappears afterwards.
+            try {
+                progress.onPhase("打包并备份 Adreno 根镜像")
+                val gpuRoot = prepareGpuRoot(images.second, progress)
+                progress.onLog("已生成独立 Adreno 根镜像：${gpuRoot.length()} 字节；原 OSMesa 镜像保留")
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                if (e.message == "已取消") throw e
+                // OSMesa remains bootable if experimental packaging fails. Keep the small
+                // staging tree for another attempt but clean up the multi-GB extraction.
+                cleanup(keepStagedRoot = true)
+                stage = "done"
+                progress.onLog("Adreno 根镜像生成失败：${e.message}；OSMesa 仍可启动")
+                return images
+            }
+        }
         cleanup()
         stage = "done"
         return images
@@ -664,6 +687,198 @@ class ImageBuilder(private val context: Context) {
         progress.onLog("built: system.apfs=${sys.length()} root.apfs=${rt.length()}")
     }
 
+    /** Prepare a separately cached hardware root on a background thread; stableRoot stays read-only. */
+    internal fun prepareGpuRoot(stableRoot: File): File = prepareGpuRoot(stableRoot, object : Progress {
+        override fun onPhase(phase: String) = Unit
+        override fun onProgress(done: Long, total: Long, label: String) = Unit
+        override fun onLog(line: String) { Log.i(TAG, line) }
+    })
+
+    @Synchronized
+    private fun prepareGpuRoot(stableRoot: File, progress: Progress): File {
+        check(current == null) { "请等待当前镜像构建结束" }
+        if (!stableRoot.isFile || stableRoot.length() == 0L) throw BuildError("找不到 OSMesa 根镜像")
+        val dylib = try {
+            context.assets.open(GPU_DYLIB_ASSET).use { it.readNBytes(2 * 1024 * 1024 + 1) }
+        } catch (e: java.io.IOException) {
+            throw BuildError("本安装包没有 Adreno 客体库，请改用 GPU 测试包", e)
+        }
+        if (dylib.size !in 32..(2 * 1024 * 1024) ||
+            !dylib.copyOfRange(0, 8).contentEquals(byteArrayOf(0xcf.toByte(), 0xfa.toByte(), 0xed.toByte(), 0xfe.toByte(), 12, 0, 0, 1))) {
+            throw BuildError("Adreno 客体库不是正确的 ARM64 Mach-O 文件")
+        }
+        val stableDigest = sha256(stableRoot)
+        val key = MessageDigest.getInstance("SHA-256").apply {
+            update(stableDigest)
+            update(dylib)
+        }.digest().joinToString("") { "%02x".format(it.toInt() and 0xff) }
+        val cache = File(context.filesDir, "gpu-guest").apply { mkdirs() }
+        if (!Files.isDirectory(cache.toPath(), NOFOLLOW_LINKS)) throw BuildError("Adreno 根镜像缓存目录无效")
+        val target = File(cache, "root-gpu-v2-$key.apfs")
+        if (Files.isRegularFile(target.toPath(), NOFOLLOW_LINKS) && isApfsContainer(target)) return target
+        if (Files.exists(target.toPath(), NOFOLLOW_LINKS)) throw BuildError("Adreno 私有缓存损坏，请联系维护者")
+
+        val shared = StoragePaths.publicRoot(context)?.let { publicRoot ->
+            runCatching { GpuImageStore.directory(publicRoot, key) }.onFailure {
+                progress.onLog("Adreno 共享备份目录不可用：${it.message}")
+            }.getOrNull()
+        }
+        val stageRoot = File(userlandDir, "root")
+        val stageImage = File(userlandDir, "root.apfs")
+        val local = Files.isDirectory(stageRoot.toPath(), NOFOLLOW_LINKS) && stageImage.isFile &&
+            stageRoot.lastModified() <= stageImage.lastModified() && sha256(stageImage).contentEquals(stableDigest)
+        val stageBackup = shared?.resolve("stage.tar")
+        val gpuBackup = shared?.resolve("root-gpu.apfs")
+        /*
+         * stage.tar 是**输入**（Redwood 用户态那棵树），只由 OSMesa 根镜像决定，与来宾 dylib 无关；
+         * 但它的目录名（[key]）是「OSMesa 根 + dylib」的联合哈希。于是只要换一版 dylib，key 就变，
+         * 新 key 目录里没有材料 —— 而换包名/清数据又会同时清掉私有 stage，两条路一起断，
+         * 用户看到的就是「Adreno 根镜像不可用」（0.31.4 换 dylib 后实测踩到）。
+         * 所以材料另存一份按 OSMesa 根哈希命名的稳定位置，换 dylib 时直接复用。
+         */
+        val stableHex = stableDigest.joinToString("") { "%02x".format(it.toInt() and 0xff) }
+        val stageStore = runCatching {
+            StoragePaths.publicRoot(context)?.let { publicRoot ->
+                var dir = publicRoot
+                for (name in listOf("gpu", "adreno-v2", "stages", stableHex)) {
+                    dir = File(dir, name)
+                    dir.mkdir()
+                }
+                dir.takeIf { Files.isDirectory(it.toPath(), NOFOLLOW_LINKS) }
+            }
+        }.onFailure { progress.onLog("Adreno 材料稳定目录不可用：${it.message}") }.getOrNull()
+        val stageStable = stageStore?.resolve("stage.tar")
+            ?.takeIf { Files.isRegularFile(it.toPath(), NOFOLLOW_LINKS) }
+        var stageSource = stageBackup?.takeIf { Files.isRegularFile(it.toPath(), NOFOLLOW_LINKS) }
+            ?: stageStable
+        if (!local && stageSource == null) {
+            /*
+             * 稳定位置也还是空的（第一次换 dylib 就是这种情形）：退一步，到**兄弟 key 目录**里
+             * 找同一 OSMesa 根的 stage.tar。判据是再算一遍 key —— key = sha256(stableDigest ‖ dylib)，
+             * 所以拿候选目录里留档的 dylib 与当前 stableDigest 算出同一个 key，才证明那份材料
+             * 来自同一个根；算不出来就不认，绝不按文件名猜。
+             */
+            stageSource = runCatching {
+                shared?.parentFile?.listFiles()?.firstNotNullOfOrNull { sibling ->
+                    if (!sibling.isDirectory || sibling.name.length != 64) return@firstNotNullOfOrNull null
+                    val candidate = File(sibling, "stage.tar")
+                    val recorded = File(sibling, "gpu-libredwood-gl.dylib")
+                    if (!Files.isRegularFile(candidate.toPath(), NOFOLLOW_LINKS) ||
+                        !Files.isRegularFile(recorded.toPath(), NOFOLLOW_LINKS)
+                    ) return@firstNotNullOfOrNull null
+                    val probe = MessageDigest.getInstance("SHA-256").apply {
+                        update(stableDigest)
+                        update(recorded.readBytes())
+                    }.digest().joinToString("") { "%02x".format(it.toInt() and 0xff) }
+                    candidate.takeIf { probe == sibling.name }
+                }
+            }.getOrNull()
+            if (stageSource != null) {
+                progress.onLog("从同一 OSMesa 根的 ${stageSource.parentFile?.name?.take(8)}… 复用 Adreno 构建材料")
+            }
+        }
+        if (!local && stageSource == null) {
+            throw BuildError("没有与当前镜像匹配的 Adreno 备份或构建材料；请确认共享下载目录权限，或在「资源」页重新编译一次（沿用已下载 IPSW）")
+        }
+        if (!local && stageSource === stageStable) {
+            progress.onLog("沿用 $stableHex 的 Adreno 构建材料（与本版 dylib 无关，按 OSMesa 根镜像复用）")
+        }
+        val packer = File(scriptsDir, "tools/apfs/mkapfs.py")
+        if (!packer.isFile || !File(toolchainDir, "bin/python3").isFile) throw BuildError("缺少 APFS 打包工具，请重新部署资源")
+        val work = Files.createTempDirectory(cache.toPath(), ".gpu-guest-").toFile()
+        try {
+            File(work, "sem.").mkdir()
+            File(work, "gpu.dylib").writeBytes(dylib)
+            File(work, "gpu-root-overlay.py").writeText(GPU_ROOT_SCRIPT)
+            context.assets.open("gpu-stage-archive.py").use { input ->
+                File(work, "gpu-stage-archive.py").outputStream().use { input.copyTo(it) }
+            }
+            val base = File(work, "base.apfs")
+            GpuImageStore.copyBounded(stableRoot, base, GpuImageStore.MAX_ROOT)
+            if (!sha256(base).contentEquals(stableDigest)) throw BuildError("启动准备期间 OSMesa 根镜像已变化，请重试")
+            val savedStage = File(work, "stage.tar")
+            if (!local) GpuImageStore.copyBounded(checkNotNull(stageSource), savedStage, GpuImageStore.MAX_STAGE)
+            runProcess(
+                cmd = listOf("python3", "gpu-root-overlay.py"),
+                dir = work,
+                progress = progress,
+                env = mapOf("HIOS_GPU_SOURCE" to (if (local) stageRoot.absolutePath else ""),
+                    "HIOS_GPU_PACKER" to packer.absolutePath,
+                    "HIOS_GPU_PUBLISH" to (if (local && shared != null) "1" else "0")),
+                directExec = true,
+                phaseFor = { null },
+            )
+            val candidate = File(work, "root-gpu.apfs")
+            if (!isApfsContainer(candidate)) throw BuildError("Adreno APFS 打包器未生成完整根镜像")
+            val verified = File(work, "verified-public.apfs")
+            val reuse = gpuBackup != null && runCatching {
+                GpuImageStore.copyBounded(gpuBackup, verified, GpuImageStore.MAX_ROOT)
+                sha256(candidate).contentEquals(sha256(verified))
+            }.getOrDefault(false)
+            if (reuse) progress.onLog("已校验并从共享目录恢复 Adreno 根镜像")
+            else if (!local) progress.onLog("已从校验通过的共享材料恢复 Adreno 根镜像，无需重编 IPSW")
+            Files.move((if (reuse) verified else candidate).toPath(), target.toPath(), ATOMIC_MOVE)
+            runCatching {
+                if (stageBackup != null && savedStage.isFile) GpuImageStore.publish(savedStage, stageBackup, GpuImageStore.MAX_STAGE)
+                // 同时写一份到稳定位置：下一版 dylib（新的 key）就不必再要求用户重编镜像。
+                if (stageStable == null && stageStore != null && savedStage.isFile) {
+                    runCatching { GpuImageStore.publish(savedStage, stageStore.resolve("stage.tar"), GpuImageStore.MAX_STAGE) }
+                }
+                if (gpuBackup != null) GpuImageStore.publish(target, gpuBackup, GpuImageStore.MAX_ROOT)
+                // 0.30.1：dylib 与清单也留公共目录。清掉 App 数据后可只看公共目录就知道这份
+                // Adreno 根是用哪一版 dylib 叠出来的；dylib 本身也是重发布需要的最少材料。
+                if (shared != null) {
+                    val gpuDylib = File(work, "gpu.dylib")
+                    val sharedDylib = File(shared, "gpu-libredwood-gl.dylib")
+                    if (gpuDylib.isFile) GpuImageStore.publish(gpuDylib, sharedDylib, 2L shl 20)
+                    if (stageBackup?.isFile == true && gpuBackup?.isFile == true && sharedDylib.isFile) {
+                        GpuImageStore.publishManifest(
+                            File(shared, "materials.txt"),
+                            GpuImageStore.materialsManifest(
+                                key = key,
+                                stageSha = sha256Hex(stageBackup),
+                                gpuSha = sha256Hex(gpuBackup),
+                                dylibSha = sha256Hex(sharedDylib),
+                            ),
+                        )
+                    }
+                }
+            }.onFailure { progress.onLog("Adreno 共享备份写入失败（私有运行缓存仍有效）：${it.message}") }
+            return target
+        } finally {
+            // The staged tree deliberately preserves symlinks for APFS; don't traverse them
+            // while deleting the temporary copy, even if they point at a host directory.
+            runCatching {
+                Files.walk(work.toPath()).use { paths ->
+                    paths.sorted(Comparator.reverseOrder()).forEach { Files.deleteIfExists(it) }
+                }
+            }.onFailure { Log.w(TAG, "无法清理临时 Adreno 根目录", it) }
+        }
+    }
+
+    private fun sha256Hex(file: File): String =
+        sha256(file).joinToString("") { "%02x".format(it.toInt() and 0xff) }
+
+    private fun sha256(file: File): ByteArray = MessageDigest.getInstance("SHA-256").let { digest ->
+        file.inputStream().use { stream ->
+            val buffer = ByteArray(128 * 1024)
+            while (true) {
+                val n = stream.read(buffer)
+                if (n < 0) break
+                digest.update(buffer, 0, n)
+            }
+        }
+        digest.digest()
+    }
+
+    private fun isApfsContainer(file: File): Boolean = runCatching {
+        java.io.RandomAccessFile(file, "r").use { f ->
+            if (f.length() < 4096 || f.length() % 4096L != 0L) return@use false
+            f.seek(32)
+            f.readInt() == 0x4e585342 // APFS NXSB magic
+        }
+    }.getOrDefault(false)
+
     /** Copy the images to the public directory (the user's permanent location) and return them. */
     private fun collect(publishDir: File?, progress: Progress): Pair<File, File> {
         val sys = File(userlandDir, "system.apfs")
@@ -730,7 +945,7 @@ class ImageBuilder(private val context: Context) {
     }
 
     /** Delete the ~9 GB of intermediates: the extraction, the DMGs and the staging trees. */
-    private fun cleanup() {
+    private fun cleanup(keepStagedRoot: Boolean = false) {
         checkpoint.reset()
         var freed = 0L
         fun rm(f: File) {
@@ -747,6 +962,7 @@ class ImageBuilder(private val context: Context) {
         ios165Dir.listFiles { f -> f.name.startsWith("extract-") }?.forEach { rm(it) }
         for (name in listOf("sysroot", "root", "obj", "flashboot", "flashboot.os",
             "flashboot.boot.apfs", "flashboot.os.apfs", "flashboot.apfs", "hello")) {
+            if (keepStagedRoot && name == "root") continue
             val f = File(userlandDir, name)
             if (f.exists()) rm(f)
         }
@@ -807,6 +1023,7 @@ class ImageBuilder(private val context: Context) {
         dir: File,
         progress: Progress,
         env: Map<String, String> = emptyMap(),
+        directExec: Boolean = false,
         phaseFor: (String) -> String?
     ) {
         // The wrapper writes its own pid ($$ survives the exec) so cancel() can kill the whole
@@ -825,7 +1042,10 @@ class ImageBuilder(private val context: Context) {
         // set, which starts with toolchain/bin, so build.sh's bare `python3` / `7zz` calls are fine.
         val shell = File(toolchainDir, "bin/bash").absolutePath
         val pidFile = File(dir, ".build-pid").apply { delete() }
-        val script = "echo \$\$ > '" + pidFile.absolutePath + "'; exec '" + shell + "' \"\$@\""
+        // Fetch/build scripts still explicitly run with Bash. Native tools must be exec'd,
+        // not passed as Bash script paths (that fails with exit 126 on ELF binaries).
+        val execTarget = if (directExec) "" else "'$shell' "
+        val script = "echo \$\$ > '" + pidFile.absolutePath + "'; exec " + execTarget + "\"\$@\""
         val wrapped = listOf(shell, "-c", script, "build", *cmd.toTypedArray())
         val pb = ProcessBuilder(wrapped).directory(dir)
         val e = pb.environment()
@@ -916,6 +1136,54 @@ class ImageBuilder(private val context: Context) {
 
     companion object {
         private const val TAG = "ImageBuilder"
+        private const val GPU_DYLIB_ASSET = "gpu-libredwood-gl.dylib"
+        private val GPU_ROOT_SCRIPT = """
+            import filecmp, os, pathlib, shutil, subprocess, sys
+
+            def pack(output):
+                subprocess.run([sys.executable, os.environ['HIOS_GPU_PACKER'], '-z', '--plain', 'fw',
+                                '-o', output, 'redwood=root'], check=True)
+
+            source = os.environ['HIOS_GPU_SOURCE']
+            publish = os.environ['HIOS_GPU_PUBLISH'] == '1'
+            copied = pathlib.Path('root')
+            if source:
+                # Never update the staging tree, which is also used for the OSMesa image.
+                shutil.copytree(source, copied, symlinks=True)
+            else:
+                subprocess.run([sys.executable, 'gpu-stage-archive.py', 'restore', 'stage.tar', 'root'], check=True)
+            if not source or publish:
+                # UUIDs depend on the output basename; match userland/build.sh exactly.
+                pack('root.apfs')
+                if not filecmp.cmp('base.apfs', 'root.apfs', shallow=False):
+                    if not source:
+                        sys.exit('Adreno 共享材料与当前 OSMesa 根镜像不匹配；不会启动共享镜像')
+                    print('Adreno 构建树无法按字节还原 OSMesa 根镜像，跳过共享材料备份')
+                    publish = False
+            if publish:
+                result = subprocess.run([sys.executable, 'gpu-stage-archive.py', 'archive', 'root', 'stage.tmp'])
+                if result.returncode == 0:
+                    os.rename('stage.tmp', 'stage.tar')
+                else:
+                    print('Adreno 构建材料快照失败；私有构建继续')
+            for subdir in ('bin', 'etc', 'lib'):
+                path = copied / subdir
+                if path.is_symlink() or not path.is_dir():
+                    sys.exit('invalid GPU staging directory: ' + subdir)
+            redwood = copied / 'lib/libredwood-gl.dylib'
+            jobs = copied / 'etc/rc.jobs'
+            dhcp = copied / 'bin/net_test'
+            for path in (redwood, jobs, dhcp):
+                if path.is_symlink() or not path.is_file():
+                    sys.exit('missing regular GPU staging file: ' + str(path))
+            shutil.copyfile('gpu.dylib', redwood)
+            command = '/redwood/bin/net_test dhcp en0 waitaddr en0 60'
+            if command not in jobs.read_text().splitlines():
+                with jobs.open('a') as output:
+                    output.write('\n' + command + '\n')
+            subprocess.run([sys.executable, os.environ['HIOS_GPU_PACKER'], '-z', '--plain', 'fw',
+                            '-o', 'root-gpu.apfs', 'redwood=root'], check=True)
+        """.trimIndent()
 
         private const val TAIL_LINES = 40
 

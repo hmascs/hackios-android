@@ -138,24 +138,27 @@ object BootPhase {
         // 容器管理器还主动回答「不支持」）。每 spawn 一个 job 都报一次，报完该活的都活着，
         // 所以这是背景噪音，不是本轮要修的东西。
         // 渲染倍率：fbscale 决定 WindowServer 的帧缓冲有多大。3 = 1125×2436（与 ramfb 相同），
-        // 1 = 375×812 —— 后者合成出来的画面落不进 ramfb，屏幕全黑，而串口里一切"正常"。
-        // 这是 0.21.0 之前 App 自己写死 fbscale=1 留下的坑，解析出来是为了下次一眼看到。
+        // 1 = 375×812 —— 倍率不同步时合成出来的画面落不进 ramfb，屏幕全黑，而串口里一切"正常"
+        // （0.21.0 之前 App 自己写死 fbscale=1 留下的坑）。0.31.4 起倍率由
+        // Constants.SCREEN_SCALE 统一决定，所以这里不再写死 3，而是跟它比；
+        // 详见 docs/render-scale.md。
         val scale = Regex("""main-screen-scale[^\n]*?value = \+([0-9.]+)""")
             .find(l)?.groupValues?.get(1)?.toDoubleOrNull()
         val screen = Regex("""initial main screen size:\{(\d+), (\d+)\} scale:(\d+)""").find(l)
             ?: Regex("""main display width (\d+) height (\d+) framebuffer width \d+ height \d+ scale (\d+)""")
                 .find(l)
         val display = when {
-            scale != null && scale < 3.0 ->
-                "渲染倍率 ${scale.toInt()}x（main-screen-scale）：WindowServer 只建 ${(375 * scale).toInt()}×${(812 * scale).toInt()} " +
-                    "的帧缓冲，而 ramfb 是 ${Constants.SCREEN_W}×${Constants.SCREEN_H} —— 合成结果落不进去，画面全黑。" +
-                    "启动参数 fbscale 必须是 3（改动后 payload 自动重建）。"
+            scale != null && scale.toInt() != Constants.SCREEN_SCALE ->
+                "渲染倍率 ${scale.toInt()}x（main-screen-scale）：WindowServer 建 ${(375 * scale).toInt()}×${(812 * scale).toInt()} " +
+                    "的帧缓冲，而 App 与 ramfb 按 ${Constants.SCREEN_SCALE}x（${Constants.SCREEN_W}×${Constants.SCREEN_H}）走 —— " +
+                    "两者不一致，A6 帧环会按错误尺寸静默降级，ramfb 那条路则画面全黑。fbscale 与 SCREEN_SCALE 必须相同。"
 
             screen != null -> {
                 val w = screen.groupValues[1]
                 val h = screen.groupValues[2]
                 val sc = screen.groupValues[3]
-                if (sc != "3") "WindowServer 屏幕 ${w}×${h} @${sc}x，与 ramfb ${Constants.SCREEN_W}×${Constants.SCREEN_H} 不一致 ⚠"
+                if (sc != Constants.SCREEN_SCALE.toString())
+                    "WindowServer 屏幕 ${w}×${h} @${sc}x，与 App/ramfb 的 ${Constants.SCREEN_W}×${Constants.SCREEN_H}（${Constants.SCREEN_SCALE}x）不一致 ⚠"
                 else "WindowServer 屏幕 ${w}×${h} @${sc}x，与 ramfb 一致"
             }
             else -> null
@@ -195,9 +198,8 @@ object BootPhase {
             else -> null
         }
         val noise = when {
-            l.contains("denied attempt to escape CPU monitor") ->
-                "lsd 反复申请脱离 CPU 限额被拒：这是 iOS 服务在查镜像里没有的守护进程，" +
-                    "已知非阻塞噪音。0.25.0 的精简作业集（FAST=1）会去掉大部分来源。"
+            l.contains("denied attempt to escape CPU monitor") || l.contains("CPU monitor self-denials:") ->
+                "有进程修改自身 CPU 监控限额的请求被拒绝或裁剪；这与 launchd 查找服务失败是不同事件。"
             l.contains("failed lookup") && l.contains("error = 3: No such process") ->
                 "launchd 有查询未注册服务（No such process），属按需作业缺失，非内核故障"
             else -> null
@@ -225,7 +227,7 @@ object BootPhase {
             }
             when {
                 en0 -> "网络：en0 已挂上" + (frames?.let { "（$it）" } ?: "（日志里还没有收发统计）")
-                noDevice -> "网络：QEMU 未提供 virtio 网卡 —— 检查设置页「虚拟网络」是否开启，或装的是旧 APK"
+                noDevice -> "网络：QEMU 未提供 virtio 网卡 —— 检查首页「虚拟网络」是否开启，或装的是旧 APK"
                 hasDevice -> "网络：网卡已被内核识别，但 en0 没挂上（链路未就绪）"
                 noIface -> "网络：内核没有可用网络接口"
                 else -> null

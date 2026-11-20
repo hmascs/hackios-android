@@ -1,0 +1,34 @@
+{
+  "schema": "hackios-redwood-surface-tail-overlay-v1",
+  "reference": "/root/workspace/hackios-redwood-reference/userland",
+  "inputs": {
+    "src/eagl.c": {
+      "reference_sha256": "4c33be251a7991e7ee9dbdc7c28ef079ac2d9ca5cec3c5d48c11a8f9078bbc12",
+      "reference_bytes": 169471,
+      "overlay_sha256": "8d3efdf70133d81d05b0dbb983a73be0fcd3d6d54a3d44f5d97634e1941f4c5c",
+      "overlay_bytes": 169828
+    },
+    "src/eagl_slots.txt": {
+      "reference_sha256": "da86f4a9fe193f53236128eaf8b56ca5e00060518e8f674f9b852e9886804cbf",
+      "reference_bytes": 12407,
+      "overlay_sha256": "da86f4a9fe193f53236128eaf8b56ca5e00060518e8f674f9b852e9886804cbf",
+      "overlay_bytes": 12407
+    },
+    "src/redwood_gl.h": {
+      "reference_sha256": "09ea021f0ab8f88d3a4e52ef83bc15c2ff025b7fc4ffdd1da7324098845d3b51",
+      "reference_bytes": 1654,
+      "overlay_sha256": "09ea021f0ab8f88d3a4e52ef83bc15c2ff025b7fc4ffdd1da7324098845d3b51",
+      "overlay_bytes": 1654
+    },
+    "mkeagl.py": {
+      "reference_sha256": "c12e554fd53e0ba95c64cec75ce87e64f37ec64013539a2f271956ad1db4f66d",
+      "reference_bytes": 7058,
+      "overlay_sha256": "c12e554fd53e0ba95c64cec75ce87e64f37ec64013539a2f271956ad1db4f66d",
+      "overlay_bytes": 7058
+    }
+  },
+  "patch_sha256": "30c1b9bf1e595a49b9fb2db8073517905606909b8f083abc6f5271455754b33f",
+  "scope": "minimal REDWOOD_USERLAND build input, not complete userland/runtime image",
+  "changes": "surface_changed only: one bounded partial-word mix, no seed/stride/poll/readback changes",
+  "runtime_verified": false
+}
